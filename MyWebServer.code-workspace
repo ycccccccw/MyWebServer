@@ -1,0 +1,18 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"files.associations": {
+			"iostream": "cpp",
+			"string": "cpp",
+			"io_context": "cpp",
+			"executor": "cpp",
+			"*.tcc": "cpp",
+			"cerrno": "cpp",
+			"functional": "cpp"
+		}
+	}
+}
