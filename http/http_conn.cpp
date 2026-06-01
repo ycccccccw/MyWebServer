@@ -20,6 +20,7 @@ locker m_lock;
 map<string, string> users;//存储数据库中所有已注册用户的用户名和密码（在程序启动时就先提前全部取出）
 
 //prepared statement
+// prepared statement
 static bool insert_user_by_stmt(MYSQL *mysql, const string &name, const string &password)
 {
     const char *sql = "INSERT INTO user(username, passwd) VALUES(?, ?)";
@@ -27,7 +28,7 @@ static bool insert_user_by_stmt(MYSQL *mysql, const string &name, const string &
     MYSQL_STMT *stmt = mysql_stmt_init(mysql);
     if (stmt == NULL)
     {
-        LOG_ERROR("mysql_stmt_init error");
+        fprintf(stderr, "mysql_stmt_init error\n");
         return false;
     }
 
@@ -37,7 +38,7 @@ static bool insert_user_by_stmt(MYSQL *mysql, const string &name, const string &
     {
         if (mysql_stmt_prepare(stmt, sql, strlen(sql)) != 0)
         {
-            LOG_ERROR("mysql_stmt_prepare error:%s", mysql_stmt_error(stmt));
+            fprintf(stderr, "mysql_stmt_prepare error:%s\n", mysql_stmt_error(stmt));
             break;
         }
 
@@ -59,13 +60,13 @@ static bool insert_user_by_stmt(MYSQL *mysql, const string &name, const string &
 
         if (mysql_stmt_bind_param(stmt, bind) != 0)
         {
-            LOG_ERROR("mysql_stmt_bind_param error:%s", mysql_stmt_error(stmt));
+            fprintf(stderr, "mysql_stmt_bind_param error:%s\n", mysql_stmt_error(stmt));
             break;
         }
 
         if (mysql_stmt_execute(stmt) != 0)
         {
-            LOG_ERROR("mysql_stmt_execute error:%s", mysql_stmt_error(stmt));
+            fprintf(stderr, "mysql_stmt_execute error:%s\n", mysql_stmt_error(stmt));
             break;
         }
 
@@ -75,6 +76,7 @@ static bool insert_user_by_stmt(MYSQL *mysql, const string &name, const string &
     mysql_stmt_close(stmt);
     return success;
 }
+
 
 
 /*------------------------------SQL Pool 初始化 BEGIN--------------------------------------------------------*/
@@ -411,62 +413,47 @@ http_conn::HTTP_CODE http_conn::do_request()
         password[j] = '\0';
 
         //2.2 处理注册请求
-        if (*(p + 1) == '3')
+    if (*(p + 1) == '3')
+{
+        string user_name(name);
+        string hashed_password = password_hash::make_password_hash(password);
+
+        if (hashed_password.empty())
         {
-            //构造sql INSERT语句（插入）
-           std::string hashed_password = password_hash::make_password_hash(password);
-if (hashed_password.empty())
-{
-    strcpy(m_url, "/registerError.html");
-}
-else
-{
-    char escaped_name[200];
-    char escaped_hash[600];
+            strcpy(m_url, "/registerError.html");
+        }
+        else if (users.find(user_name) == users.end())
+        {
+            m_lock.lock();
 
-    mysql_real_escape_string(mysql, escaped_name, name, strlen(name));
-    mysql_real_escape_string(mysql, escaped_hash, hashed_password.c_str(), hashed_password.size());
-
-    std::string sql_insert = "INSERT INTO user(username, passwd) VALUES('";
-    sql_insert += escaped_name;
-    sql_insert += "', '";
-    sql_insert += escaped_hash;
-    sql_insert += "')";
-
-
-            //首先查看数据库中是否已有重复的用户名：map中查找
-            //没有重名的，进行增加数据
-            if (users.find(name) == users.end())
+            bool insert_ok = insert_user_by_stmt(mysql, user_name, hashed_password);
+            if (insert_ok)
             {
-                m_lock.lock();
-                int res = mysql_query(mysql, sql_insert.c_str());
-                users.insert(pair<string, string>(name, hashed_password));
-
-                m_lock.unlock();
-
-                if (!res)
-                    //注册成功，跳转到登录页面
-                    strcpy(m_url, "/log.html");
-                else
-                    //注册失败，跳转到错误页面
-                    strcpy(m_url, "/registerError.html");
+                users.insert(pair<string, string>(user_name, hashed_password));
             }
+
+            m_lock.unlock();
+
+            if (insert_ok)
+                strcpy(m_url, "/log.html");
             else
-                //注册失败，跳转到错误页面(用户名重复)
                 strcpy(m_url, "/registerError.html");
         }
-    }
-        //2.2 处理登录请求
-        //若浏览器端输入的用户名和密码在map表中可以查找到，返回1，否则返回0
-        else if (*(p + 1) == '2')
+        else
         {
-           if (users.find(name) != users.end() &&
-                password_hash::verify_password(password, users[name]))
-                strcpy(m_url, "/welcome.html");
-            else
-                strcpy(m_url, "/logError.html");
-
+            strcpy(m_url, "/registerError.html");
         }
+    }
+
+    else if (*(p + 1) == '2')
+    {
+        if (users.find(name) != users.end() &&
+            password_hash::verify_password(password, users[name]))
+            strcpy(m_url, "/welcome.html");
+        else
+            strcpy(m_url, "/logError.html");
+    }
+
     }
 
     //3. 处理跳转到注册界面的请求
