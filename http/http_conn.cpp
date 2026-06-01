@@ -1,5 +1,5 @@
 #include "http_conn.h"
-
+#include "password_hash.h"
 #include <mysql/mysql.h>
 #include <fstream>
 
@@ -18,6 +18,64 @@ const char *error_500_form = "There was an unusual problem serving the request f
 
 locker m_lock;
 map<string, string> users;//存储数据库中所有已注册用户的用户名和密码（在程序启动时就先提前全部取出）
+
+//prepared statement
+static bool insert_user_by_stmt(MYSQL *mysql, const string &name, const string &password)
+{
+    const char *sql = "INSERT INTO user(username, passwd) VALUES(?, ?)";
+
+    MYSQL_STMT *stmt = mysql_stmt_init(mysql);
+    if (stmt == NULL)
+    {
+        LOG_ERROR("mysql_stmt_init error");
+        return false;
+    }
+
+    bool success = false;
+
+    do
+    {
+        if (mysql_stmt_prepare(stmt, sql, strlen(sql)) != 0)
+        {
+            LOG_ERROR("mysql_stmt_prepare error:%s", mysql_stmt_error(stmt));
+            break;
+        }
+
+        MYSQL_BIND bind[2];
+        memset(bind, 0, sizeof(bind));
+
+        unsigned long name_length = name.size();
+        unsigned long password_length = password.size();
+
+        bind[0].buffer_type = MYSQL_TYPE_STRING;
+        bind[0].buffer = (void *)name.c_str();
+        bind[0].buffer_length = name_length;
+        bind[0].length = &name_length;
+
+        bind[1].buffer_type = MYSQL_TYPE_STRING;
+        bind[1].buffer = (void *)password.c_str();
+        bind[1].buffer_length = password_length;
+        bind[1].length = &password_length;
+
+        if (mysql_stmt_bind_param(stmt, bind) != 0)
+        {
+            LOG_ERROR("mysql_stmt_bind_param error:%s", mysql_stmt_error(stmt));
+            break;
+        }
+
+        if (mysql_stmt_execute(stmt) != 0)
+        {
+            LOG_ERROR("mysql_stmt_execute error:%s", mysql_stmt_error(stmt));
+            break;
+        }
+
+        success = true;
+    } while (false);
+
+    mysql_stmt_close(stmt);
+    return success;
+}
+
 
 /*------------------------------SQL Pool 初始化 BEGIN--------------------------------------------------------*/
 //main中初始化WebServer类中的m_connPool时会同时在HTTP类中取出一个数据库连接用于提前将所有注册过的用户信息取出存在map中
@@ -356,21 +414,34 @@ http_conn::HTTP_CODE http_conn::do_request()
         if (*(p + 1) == '3')
         {
             //构造sql INSERT语句（插入）
-            char *sql_insert = (char *)malloc(sizeof(char) * 200);
-            strcpy(sql_insert, "INSERT INTO user(username, passwd) VALUES(");
-            strcat(sql_insert, "'");
-            strcat(sql_insert, name);
-            strcat(sql_insert, "', '");
-            strcat(sql_insert, password);
-            strcat(sql_insert, "')");
+           std::string hashed_password = password_hash::make_password_hash(password);
+if (hashed_password.empty())
+{
+    strcpy(m_url, "/registerError.html");
+}
+else
+{
+    char escaped_name[200];
+    char escaped_hash[600];
+
+    mysql_real_escape_string(mysql, escaped_name, name, strlen(name));
+    mysql_real_escape_string(mysql, escaped_hash, hashed_password.c_str(), hashed_password.size());
+
+    std::string sql_insert = "INSERT INTO user(username, passwd) VALUES('";
+    sql_insert += escaped_name;
+    sql_insert += "', '";
+    sql_insert += escaped_hash;
+    sql_insert += "')";
+
 
             //首先查看数据库中是否已有重复的用户名：map中查找
             //没有重名的，进行增加数据
             if (users.find(name) == users.end())
             {
                 m_lock.lock();
-                int res = mysql_query(mysql, sql_insert);
-                users.insert(pair<string, string>(name, password));
+                int res = mysql_query(mysql, sql_insert.c_str());
+                users.insert(pair<string, string>(name, hashed_password));
+
                 m_lock.unlock();
 
                 if (!res)
@@ -384,15 +455,17 @@ http_conn::HTTP_CODE http_conn::do_request()
                 //注册失败，跳转到错误页面(用户名重复)
                 strcpy(m_url, "/registerError.html");
         }
-
+    }
         //2.2 处理登录请求
         //若浏览器端输入的用户名和密码在map表中可以查找到，返回1，否则返回0
         else if (*(p + 1) == '2')
         {
-            if (users.find(name) != users.end() && users[name] == password)
+           if (users.find(name) != users.end() &&
+                password_hash::verify_password(password, users[name]))
                 strcpy(m_url, "/welcome.html");
             else
                 strcpy(m_url, "/logError.html");
+
         }
     }
 
