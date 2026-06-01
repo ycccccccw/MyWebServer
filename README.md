@@ -1,6 +1,6 @@
 # MyWebServer
 
-### 2026-06-01：注册 SQL 改为 prepared statement
+### 2026-06-01：去掉数据库硬编码
 修改内容：
 
 main.cpp 不再写死 MySQL 用户名、密码和数据库名。
