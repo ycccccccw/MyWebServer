@@ -65,8 +65,7 @@ MYSQL_DATABASE
 - 登录成功后生成随机 `sid`。
 - 服务端维护 `sid -> username / expire_time` 映射。
 - 响应头返回：
-
-```http
+http
 Set-Cookie: sid=...; Max-Age=1800; HttpOnly; SameSite=Lax
 
 
@@ -93,7 +92,7 @@ Set-Cookie: sid=...; Max-Age=1800; HttpOnly; SameSite=Lax
   - `sid`
 - 敏感内容统一替换为：
 
-```text
+text
 [sensitive data masked]
 
 
