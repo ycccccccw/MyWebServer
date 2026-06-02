@@ -52,6 +52,24 @@ MYSQL_DATABASE
   - 用户名和密码通过 `mysql_stmt_bind_param()` 绑定。
 - SQL 结构和用户输入分离，用户输入不会被当成 SQL 代码执行。
 
+### 2026-06-02：增加基于 Cookie 的服务端 Session 登录态
+
+修改前：
+
+- 登录成功后只是把 URL 改成 `/welcome.html`。
+- 用户可以直接访问 `/welcome.html`。
+- 没有 session、cookie、token、过期时间校验。
+
+修改后：
+
+- 登录成功后生成随机 `sid`。
+- 服务端维护 `sid -> username / expire_time` 映射。
+- 响应头返回：
+
+```http
+Set-Cookie: sid=...; Max-Age=1800; HttpOnly; SameSite=Lax
+
+
 
 
 
