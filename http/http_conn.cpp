@@ -6,6 +6,7 @@
 #include <ctime>
 #include <sstream>
 #include <iomanip>
+#include <cctype>
 
 
 //定义http响应的一些状态信息：给浏览器返回的服务器状态信息
@@ -23,6 +24,52 @@ const char *error_500_form = "There was an unusual problem serving the request f
 
 locker m_lock;
 map<string, string> users;//存储数据库中所有已注册用户的用户名和密码（在程序启动时就先提前全部取出）
+static string to_lower_copy(const string &src)
+{
+    string dst = src;
+    for (size_t i = 0; i < dst.size(); ++i)
+    {
+        dst[i] = static_cast<char>(tolower(static_cast<unsigned char>(dst[i])));
+    }
+    return dst;
+}
+
+static bool contains_sensitive_data(const string &text)
+{
+    string lower = to_lower_copy(text);
+
+    if (lower.find("cookie:") == 0)
+        return true;
+    if (lower.find("set-cookie:") == 0)
+        return true;
+    if (lower.find("authorization:") == 0)
+        return true;
+
+    if (lower.find("password=") != string::npos)
+        return true;
+    if (lower.find("passwd=") != string::npos)
+        return true;
+    if (lower.find("token=") != string::npos)
+        return true;
+    if (lower.find("sid=") != string::npos)
+        return true;
+
+    return false;
+}
+
+static string sanitize_log_text(const char *text)
+{
+    if (text == NULL)
+        return "";
+
+    string value(text);
+
+    if (contains_sensitive_data(value))
+        return "[sensitive data masked]";
+
+    return value;
+}
+
 struct session_data
 {
     string username;
@@ -466,7 +513,9 @@ http_conn::HTTP_CODE http_conn::parse_headers(char *text)
     else
     {
         //其它字段本项目不解析，直接跳过
-        LOG_INFO("oop!unknow header: %s", text);
+        string safe_text = sanitize_log_text(text);
+        LOG_INFO("oop!unknow header: %s", safe_text.c_str());
+
     }
     return NO_REQUEST;
 }
@@ -687,7 +736,9 @@ http_conn::HTTP_CODE http_conn::process_read()
         text = get_line();
         m_start_line = m_checked_idx;//更新为下一行的起始位置，方便下次调用get_line获取当前行的字符串
 
-        LOG_INFO("%s", text);
+        string safe_text = sanitize_log_text(text);
+        LOG_INFO("%s", safe_text.c_str());
+
 
         //主状态机根据当前状态机状态进行报文解析
         switch(m_check_state){
@@ -859,7 +910,8 @@ bool http_conn::add_response(const char *format, ...)
     m_write_idx += len;
     va_end(arg_list);
 
-    LOG_INFO("request:%s", m_write_buf);
+    LOG_INFO("response buffer updated, write_idx=%d", m_write_idx);
+
 
     return true;
 }

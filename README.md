@@ -70,6 +70,33 @@ MYSQL_DATABASE
 Set-Cookie: sid=...; Max-Age=1800; HttpOnly; SameSite=Lax
 
 
+### 2026-06-02：日志敏感信息脱敏
+
+修改前：
+
+- `process_read()` 会把 HTTP 请求行、请求头、POST body 原样写入日志。
+- 登录/注册时，POST body 中可能包含 `password=...`。
+- 增加 session 后，请求头中可能包含 `Cookie: sid=...`。
+- 响应头中可能包含 `Set-Cookie: sid=...`。
+- 如果这些内容进入日志，日志泄露时会暴露密码或登录凭证。
+
+修改后：
+
+- 新增 `sanitize_log_text()` 脱敏函数。
+- 对以下内容进行脱敏：
+  - `Cookie`
+  - `Set-Cookie`
+  - `Authorization`
+  - `password`
+  - `passwd`
+  - `token`
+  - `sid`
+- 敏感内容统一替换为：
+
+```text
+[sensitive data masked]
+
+
 
 
 
