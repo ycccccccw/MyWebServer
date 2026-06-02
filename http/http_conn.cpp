@@ -1,7 +1,12 @@
 #include "http_conn.h"
 #include "password_hash.h"
 #include <mysql/mysql.h>
+#include <openssl/rand.h>
 #include <fstream>
+#include <ctime>
+#include <sstream>
+#include <iomanip>
+
 
 //定义http响应的一些状态信息：给浏览器返回的服务器状态信息
 //title：状态行的响应信息
@@ -18,6 +23,104 @@ const char *error_500_form = "There was an unusual problem serving the request f
 
 locker m_lock;
 map<string, string> users;//存储数据库中所有已注册用户的用户名和密码（在程序启动时就先提前全部取出）
+struct session_data
+{
+    string username;
+    time_t expire_time;
+};
+
+static locker session_lock;
+static map<string, session_data> sessions;
+
+static const int SESSION_EXPIRE_SECONDS = 30 * 60;
+
+static string random_hex(size_t bytes)
+{
+    unsigned char buf[64];
+
+    if (bytes > sizeof(buf))
+        bytes = sizeof(buf);
+
+    if (RAND_bytes(buf, bytes) != 1)
+        return "";
+
+    std::ostringstream oss;
+    for (size_t i = 0; i < bytes; ++i)
+    {
+        oss << std::hex << std::setw(2) << std::setfill('0')
+            << static_cast<int>(buf[i]);
+    }
+
+    return oss.str();
+}
+
+static string create_session(const string &username)
+{
+    string sid = random_hex(32);
+    if (sid.empty())
+        return "";
+
+    session_data data;
+    data.username = username;
+    data.expire_time = time(NULL) + SESSION_EXPIRE_SECONDS;
+
+    session_lock.lock();
+    sessions[sid] = data;
+    session_lock.unlock();
+
+    return sid;
+}
+
+static string get_sid_from_cookie(const char *cookie)
+{
+    if (cookie == NULL)
+        return "";
+
+    string cookies(cookie);
+    string key = "sid=";
+
+    size_t pos = cookies.find(key);
+    if (pos == string::npos)
+        return "";
+
+    pos += key.size();
+    size_t end = cookies.find(';', pos);
+
+    if (end == string::npos)
+        return cookies.substr(pos);
+
+    return cookies.substr(pos, end - pos);
+}
+
+static bool check_session(const char *cookie)
+{
+    string sid = get_sid_from_cookie(cookie);
+    if (sid.empty())
+        return false;
+
+    bool ok = false;
+    time_t now = time(NULL);
+
+    session_lock.lock();
+
+    map<string, session_data>::iterator it = sessions.find(sid);
+    if (it != sessions.end())
+    {
+        if (it->second.expire_time > now)
+        {
+            ok = true;
+        }
+        else
+        {
+            sessions.erase(it);
+        }
+    }
+
+    session_lock.unlock();
+
+    return ok;
+}
+
 
 //prepared statement
 // prepared statement
@@ -226,7 +329,11 @@ void http_conn::init()
     m_version = 0;
     m_content_length = 0;
     m_host = 0;
+    m_cookie = 0;
+    m_login_user.clear();
+    m_set_cookie_sid.clear();
     m_start_line = 0;
+
     m_checked_idx = 0;
     m_read_idx = 0;
     m_write_idx = 0;
@@ -349,6 +456,13 @@ http_conn::HTTP_CODE http_conn::parse_headers(char *text)
         text += strspn(text, " \t");
         m_host = text;
     }
+    else if (strncasecmp(text, "Cookie:", 7) == 0)
+    {
+        text += 7;
+        text += strspn(text, " \t");
+        m_cookie = text;
+    }
+
     else
     {
         //其它字段本项目不解析，直接跳过
@@ -446,14 +560,40 @@ http_conn::HTTP_CODE http_conn::do_request()
     }
 
     else if (*(p + 1) == '2')
+{
+    if (users.find(name) != users.end() &&
+        password_hash::verify_password(password, users[name]))
     {
-        if (users.find(name) != users.end() &&
-            password_hash::verify_password(password, users[name]))
+        m_login_user = name;
+        m_set_cookie_sid = create_session(m_login_user);
+
+        if (!m_set_cookie_sid.empty())
             strcpy(m_url, "/welcome.html");
         else
             strcpy(m_url, "/logError.html");
     }
+    else
+    {
+        strcpy(m_url, "/logError.html");
+    }
+}
 
+
+    }
+    bool need_login = false;
+
+    if (strcmp(m_url, "/welcome.html") == 0 ||
+        *(p + 1) == '5' ||
+        *(p + 1) == '6' ||
+        *(p + 1) == '7')
+    {
+        need_login = true;
+    }
+
+    if (need_login && !check_session(m_cookie))
+    {
+        strcpy(m_url, "/log.html");
+        p = strrchr(m_url, '/');
     }
 
     //3. 处理跳转到注册界面的请求
@@ -735,8 +875,9 @@ bool http_conn::add_status_line(int status, const char *title)
 bool http_conn::add_headers(int content_len)
 {
     return add_content_length(content_len) && add_linger() &&
-           add_blank_line();
+           add_session_cookie() && add_blank_line();
 }
+
 bool http_conn::add_content_length(int content_len)
 {
     return add_response("Content-Length:%d\r\n", content_len);
@@ -749,6 +890,16 @@ bool http_conn::add_linger()
 {
     return add_response("Connection:%s\r\n", (m_linger == true) ? "keep-alive" : "close");
 }
+bool http_conn::add_session_cookie()
+{
+    if (m_set_cookie_sid.empty())
+        return true;
+
+    return add_response("Set-Cookie:sid=%s; Max-Age=%d; HttpOnly; SameSite=Lax\r\n",
+                        m_set_cookie_sid.c_str(),
+                        SESSION_EXPIRE_SECONDS);
+}
+
 bool http_conn::add_blank_line()
 {
     return add_response("%s", "\r\n");

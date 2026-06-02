@@ -79,7 +79,9 @@ private:
     bool add_content_type();
     bool add_content_length(int content_length);
     bool add_linger();
+    bool add_session_cookie();
     bool add_blank_line();
+
 
 public:
     static int m_epollfd;   //这里是主线程中的epollfd
@@ -101,8 +103,10 @@ private:
     char m_real_file[FILENAME_LEN];     //客户请求的资源在服务器上的完整路径（服务器最终返回的资源路径，root + url）
     char *m_url;                        //指向请求行中的URL的index，都是m_read_buf中的地址
     char *m_version;                    //通过请求行解析出的http版本号，同样是m_read_buf中的地址
-    char *m_host;                       //指向请求头中的host的index，同样是m_read_buf中的地址
+    char *m_host;
+    char *m_cookie;
     long m_content_length;
+
     bool m_linger;                      //用于指导服务器响应报文的Connection字段（keep-alive or close）
     char *m_file_address;
     struct stat m_file_stat;
@@ -113,7 +117,8 @@ private:
     int bytes_to_send;
     int bytes_have_send;//记录本次调用socket中write函数发送的字节数
     char *doc_root; //网站根目录地址
-
+    std::string m_login_user;
+    std::string m_set_cookie_sid;
     map<string, string> m_users;
     int m_TRIGMode;
     int m_close_log;
