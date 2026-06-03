@@ -107,7 +107,6 @@ Set-Cookie: sid=...; Max-Age=1800; HttpOnly; SameSite=Lax
 
 支持的上传类型
 
-```text
 图片：jpg、jpeg、png、gif
 视频：mp4、webm
 文本：txt
