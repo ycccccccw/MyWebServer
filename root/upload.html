@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>发布内容</title>
+</head>
+<body>
+    <h2>发布内容</h2>
+
+    <form action="/upload" method="post" enctype="multipart/form-data">
+        <p>文字内容：</p>
+        <textarea name="content" rows="6" cols="60" placeholder="写点文字..."></textarea>
+
+        <p>上传图片或视频：</p>
+        <input type="file" name="file" accept="image/*,video/*,.txt">
+
+        <br><br>
+        <input type="submit" value="发布">
+    </form>
+
+    <p><a href="/community.html">查看大家发布的内容</a></p>
+    <p><a href="/welcome.html">返回首页</a></p>
+</body>
+</html>
+

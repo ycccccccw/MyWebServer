@@ -90,11 +90,27 @@ Set-Cookie: sid=...; Max-Age=1800; HttpOnly; SameSite=Lax
   - `passwd`
   - `token`
   - `sid`
-- 敏感内容统一替换为：
+- 敏感内容统一替换为：[sensitive data masked]
 
-text
-[sensitive data masked]
+## 2026-06-02 用户内容发布功能
 
+本次新增了登录用户发布内容功能。
+
+功能说明
+
+- 登录用户可以在 `welcome.html` 点击“发布内容”进入 `upload.html`。
+- 用户可以发布文字内容。
+- 用户可以上传图片或视频。
+- 上传成功后会跳转到 `community.html`。
+- 其他登录用户可以在 `community.html` 查看所有用户发布的内容。
+- 未登录用户不能直接访问 `upload.html`、`community.html` 和 `/uploads/` 下的上传资源。
+
+支持的上传类型
+
+```text
+图片：jpg、jpeg、png、gif
+视频：mp4、webm
+文本：txt
 
 
 

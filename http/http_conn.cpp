@@ -70,6 +70,91 @@ static string sanitize_log_text(const char *text)
     return value;
 }
 
+static bool has_allowed_suffix(const string &filename)
+{
+    string lower = to_lower_copy(filename);
+
+    return lower.size() >= 4 &&
+           (lower.rfind(".jpg") == lower.size() - 4 ||
+            lower.rfind(".png") == lower.size() - 4 ||
+            lower.rfind(".gif") == lower.size() - 4 ||
+            lower.rfind(".mp4") == lower.size() - 4 ||
+            lower.rfind(".txt") == lower.size() - 4 ||
+            lower.rfind(".webm") == lower.size() - 5 ||
+            lower.rfind(".jpeg") == lower.size() - 5);
+}
+
+static string get_file_type(const string &filename)
+{
+    string lower = to_lower_copy(filename);
+
+    if (lower.rfind(".jpg") == lower.size() - 4 ||
+        lower.rfind(".png") == lower.size() - 4 ||
+        lower.rfind(".gif") == lower.size() - 4 ||
+        lower.rfind(".jpeg") == lower.size() - 5)
+        return "image";
+
+    if (lower.rfind(".mp4") == lower.size() - 4 ||
+        lower.rfind(".webm") == lower.size() - 5)
+        return "video";
+
+    if (lower.rfind(".txt") == lower.size() - 4)
+        return "text";
+
+    return "other";
+}
+
+static string get_safe_filename(const string &filename)
+{
+    string name = filename;
+
+    size_t slash_pos = name.find_last_of("/\\");
+    if (slash_pos != string::npos)
+        name = name.substr(slash_pos + 1);
+
+    string safe;
+    for (size_t i = 0; i < name.size(); ++i)
+    {
+        char c = name[i];
+        if ((c >= 'a' && c <= 'z') ||
+            (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') ||
+            c == '.' || c == '_' || c == '-')
+        {
+            safe.push_back(c);
+        }
+    }
+
+    if (safe.empty())
+        safe = "upload.dat";
+
+    return safe;
+}
+
+static string html_escape(const string &src)
+{
+    string out;
+
+    for (size_t i = 0; i < src.size(); ++i)
+    {
+        char c = src[i];
+
+        if (c == '&')
+            out += "&amp;";
+        else if (c == '<')
+            out += "&lt;";
+        else if (c == '>')
+            out += "&gt;";
+        else if (c == '"')
+            out += "&quot;";
+        else
+            out.push_back(c);
+    }
+
+    return out;
+}
+
+
 struct session_data
 {
     string username;
@@ -167,6 +252,36 @@ static bool check_session(const char *cookie)
 
     return ok;
 }
+
+static string get_session_username(const char *cookie)
+{
+    string sid = get_sid_from_cookie(cookie);
+    if (sid.empty())
+        return "";
+
+    string username;
+    time_t now = time(NULL);
+
+    session_lock.lock();
+
+    map<string, session_data>::iterator it = sessions.find(sid);
+    if (it != sessions.end())
+    {
+        if (it->second.expire_time > now)
+        {
+            username = it->second.username;
+        }
+        else
+        {
+            sessions.erase(it);
+        }
+    }
+
+    session_lock.unlock();
+
+    return username;
+}
+
 
 
 //prepared statement
@@ -377,10 +492,11 @@ void http_conn::init()
     m_content_length = 0;
     m_host = 0;
     m_cookie = 0;
+    m_content_type = 0;
     m_login_user.clear();
     m_set_cookie_sid.clear();
     m_start_line = 0;
-
+    m_body_start = 0;
     m_checked_idx = 0;
     m_read_idx = 0;
     m_write_idx = 0;
@@ -470,14 +586,18 @@ http_conn::HTTP_CODE http_conn::parse_headers(char *text)
     */
 
     //1. 遇到空行| \r | \n |，表示头部字段解析完毕
-    if(text[0] == '\0'){
-        //空行后通过头部字段中的Content-Length字段判断请求报文是否包含消息体（GET命令中Content-Length为0，POST非0）
-        if(m_content_length != 0){
-            m_check_state = CHECK_STATE_CONTENT;//消息体不为空，POST请求，主状态机还需要转移到CHECK_STATE_CONTENT，解析请求内容
-            return NO_REQUEST;
-        }
-        return GET_REQUEST;//GET请求，主状态机解析完毕，返回GET_REQUEST
+    if (text[0] == '\0')
+{
+    if (m_content_length != 0)
+    {
+        m_check_state = CHECK_STATE_CONTENT;
+        m_body_start = m_checked_idx;
+        return NO_REQUEST;
     }
+
+    return GET_REQUEST;
+}
+
     //2. 解析Connection字段，判断是keep-alive还是close
     //  HTTP/1.1默认是持久连接(keep-alive)
     else if (strncasecmp(text, "Connection:", 11) == 0)
@@ -509,6 +629,13 @@ http_conn::HTTP_CODE http_conn::parse_headers(char *text)
         text += strspn(text, " \t");
         m_cookie = text;
     }
+    else if (strncasecmp(text, "Content-Type:", 13) == 0)
+    {
+        text += 13;
+        text += strspn(text, " \t");
+        m_content_type = text;
+    }
+
 
     else
     {
@@ -523,18 +650,351 @@ http_conn::HTTP_CODE http_conn::parse_headers(char *text)
 //处理主状态机状态3：解析请求内容，获取POST请求中的消息体
 http_conn::HTTP_CODE http_conn::parse_content(char *text)
 {
-    //判断http请求的消息体是否被完整读入
-    if (m_read_idx >= (m_content_length + m_checked_idx))
+    if (m_read_idx >= m_body_start + m_content_length)
     {
-        text[m_content_length] = '\0';
-        //POST请求中最后为输入的用户名和密码
-        m_string = text;//m_string用于存储POST请求中的消息体
+        m_string = m_read_buf + m_body_start;
         return GET_REQUEST;
     }
 
-    //消息体还没读完，继续读
+    LOG_INFO("upload body not complete, read_idx=%d, need=%d, body_start=%d",
+             m_read_idx, m_body_start + m_content_length, m_body_start);
+
     return NO_REQUEST;
 }
+
+
+
+bool http_conn::save_post_to_db(const string &username, const string &content_text,
+                                const string &file_path, const string &file_type)
+{
+    const char *sql = "INSERT INTO user_posts(username, content_text, file_path, file_type) VALUES(?, ?, ?, ?)";
+
+    MYSQL_STMT *stmt = mysql_stmt_init(mysql);
+    if (stmt == NULL)
+    {
+        fprintf(stderr, "mysql_stmt_init user_posts error\n");
+        return false;
+    }
+
+    bool success = false;
+
+    do
+    {
+        if (mysql_stmt_prepare(stmt, sql, strlen(sql)) != 0)
+        {
+            fprintf(stderr, "mysql_stmt_prepare user_posts error:%s\n", mysql_stmt_error(stmt));
+            break;
+        }
+
+        MYSQL_BIND bind[4];
+        memset(bind, 0, sizeof(bind));
+
+        unsigned long username_len = username.size();
+        unsigned long content_len = content_text.size();
+        unsigned long path_len = file_path.size();
+        unsigned long type_len = file_type.size();
+
+        bind[0].buffer_type = MYSQL_TYPE_STRING;
+        bind[0].buffer = (void *)username.c_str();
+        bind[0].buffer_length = username_len;
+        bind[0].length = &username_len;
+
+        bind[1].buffer_type = MYSQL_TYPE_STRING;
+        bind[1].buffer = (void *)content_text.c_str();
+        bind[1].buffer_length = content_len;
+        bind[1].length = &content_len;
+
+        bind[2].buffer_type = MYSQL_TYPE_STRING;
+        bind[2].buffer = (void *)file_path.c_str();
+        bind[2].buffer_length = path_len;
+        bind[2].length = &path_len;
+
+        bind[3].buffer_type = MYSQL_TYPE_STRING;
+        bind[3].buffer = (void *)file_type.c_str();
+        bind[3].buffer_length = type_len;
+        bind[3].length = &type_len;
+
+        if (mysql_stmt_bind_param(stmt, bind) != 0)
+        {
+            fprintf(stderr, "mysql_stmt_bind_param user_posts error:%s\n", mysql_stmt_error(stmt));
+            break;
+        }
+
+        if (mysql_stmt_execute(stmt) != 0)
+        {
+            fprintf(stderr, "mysql_stmt_execute user_posts error:%s\n", mysql_stmt_error(stmt));
+            break;
+        }
+
+        success = true;
+    } while (false);
+
+    mysql_stmt_close(stmt);
+    return success;
+}
+
+bool http_conn::rebuild_community_page()
+{
+    if (mysql_query(mysql, "SELECT username, content_text, file_path, file_type, created_at FROM user_posts ORDER BY id DESC"))
+    {
+        fprintf(stderr, "SELECT user_posts error:%s\n", mysql_error(mysql));
+        return false;
+    }
+
+    MYSQL_RES *result = mysql_store_result(mysql);
+    if (result == NULL)
+    {
+        fprintf(stderr, "mysql_store_result user_posts error:%s\n", mysql_error(mysql));
+        return false;
+    }
+
+    string html;
+    html += "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>大家发布的内容</title></head><body>";
+    html += "<h2>大家发布的内容</h2>";
+    html += "<p><a href=\"/upload.html\">我要发布</a></p>";
+    html += "<p><a href=\"/welcome.html\">返回首页</a></p>";
+    html += "<hr>";
+
+    MYSQL_ROW row;
+    while ((row = mysql_fetch_row(result)))
+    {
+        string username = row[0] ? row[0] : "";
+        string content_text = row[1] ? row[1] : "";
+        string file_path = row[2] ? row[2] : "";
+        string file_type = row[3] ? row[3] : "";
+        string created_at = row[4] ? row[4] : "";
+
+        html += "<div style=\"margin-bottom:24px;border-bottom:1px solid #ccc;padding-bottom:16px;\">";
+        html += "<p><b>用户：</b>" + html_escape(username) + "</p>";
+        html += "<p><b>时间：</b>" + html_escape(created_at) + "</p>";
+
+        if (!content_text.empty())
+        {
+            html += "<p>" + html_escape(content_text) + "</p>";
+        }
+
+        if (!file_path.empty())
+        {
+            string safe_path = html_escape(file_path);
+
+            if (file_type == "image")
+            {
+                html += "<p><img src=\"" + safe_path + "\" style=\"max-width:500px;\"></p>";
+            }
+            else if (file_type == "video")
+            {
+                html += "<p><video src=\"" + safe_path + "\" controls style=\"max-width:600px;\"></video></p>";
+            }
+            else
+            {
+                html += "<p><a href=\"" + safe_path + "\">查看文件</a></p>";
+            }
+        }
+
+        html += "</div>";
+    }
+
+    html += "</body></html>";
+
+    mysql_free_result(result);
+
+    string path = string(doc_root) + "/community.html";
+    ofstream out(path.c_str());
+    if (!out)
+        return false;
+
+    out << html;
+    out.close();
+
+    return true;
+}
+
+bool http_conn::handle_upload()
+{
+    LOG_INFO("handle_upload start");
+
+    string username = get_session_username(m_cookie);
+    if (username.empty())
+    {
+        LOG_INFO("upload failed: no valid session");
+        strcpy(m_url, "/log.html");
+        return true;
+    }
+
+    LOG_INFO("upload username=%s", username.c_str());
+
+    if (m_content_type == NULL)
+    {
+        LOG_INFO("upload failed: content-type is null");
+        strcpy(m_url, "/upload.html");
+        return true;
+    }
+
+    string content_type(m_content_type);
+    LOG_INFO("upload content_type=%s", content_type.c_str());
+
+    string boundary_key = "boundary=";
+    size_t boundary_pos = content_type.find(boundary_key);
+
+    if (boundary_pos == string::npos)
+    {
+        LOG_INFO("upload failed: boundary not found");
+        strcpy(m_url, "/upload.html");
+        return true;
+    }
+
+    string boundary = "--" + content_type.substr(boundary_pos + boundary_key.size());
+    LOG_INFO("upload boundary=%s", boundary.c_str());
+
+    string body(m_string, m_content_length);
+    LOG_INFO("upload body size=%d", (int)body.size());
+
+    string content_text;
+    string file_path;
+    string file_type;
+
+    size_t part_pos = 0;
+
+    while (true)
+    {
+        size_t start = body.find(boundary, part_pos);
+        if (start == string::npos)
+        {
+            LOG_INFO("upload parse: no more boundary");
+            break;
+        }
+
+        start += boundary.size();
+
+        if (start + 2 < body.size() && body.substr(start, 2) == "--")
+        {
+            LOG_INFO("upload parse: reach final boundary");
+            break;
+        }
+
+        if (start + 2 < body.size() && body.substr(start, 2) == "\r\n")
+            start += 2;
+
+        size_t header_end = body.find("\r\n\r\n", start);
+        if (header_end == string::npos)
+        {
+            LOG_INFO("upload failed: part header end not found");
+            break;
+        }
+
+        string header = body.substr(start, header_end - start);
+        LOG_INFO("upload part header=%s", header.c_str());
+
+        size_t data_start = header_end + 4;
+
+        size_t next_part = body.find(boundary, data_start);
+        if (next_part == string::npos)
+        {
+            LOG_INFO("upload failed: next boundary not found");
+            break;
+        }
+
+        size_t data_end = next_part;
+        if (data_end >= 2 && body.substr(data_end - 2, 2) == "\r\n")
+            data_end -= 2;
+
+        string data = body.substr(data_start, data_end - data_start);
+        LOG_INFO("upload part data size=%d", (int)data.size());
+
+        if (header.find("name=\"content\"") != string::npos)
+        {
+            content_text = data;
+            LOG_INFO("upload content text size=%d", (int)content_text.size());
+        }
+        else if (header.find("name=\"file\"") != string::npos)
+        {
+            size_t filename_pos = header.find("filename=\"");
+            if (filename_pos != string::npos)
+            {
+                filename_pos += strlen("filename=\"");
+                size_t filename_end = header.find("\"", filename_pos);
+
+                if (filename_end != string::npos)
+                {
+                    string origin_name = header.substr(filename_pos, filename_end - filename_pos);
+                    LOG_INFO("upload origin filename=%s", origin_name.c_str());
+
+                    if (!origin_name.empty())
+                    {
+                        string safe_name = get_safe_filename(origin_name);
+                        LOG_INFO("upload safe filename=%s", safe_name.c_str());
+
+                        if (!has_allowed_suffix(safe_name))
+                        {
+                            LOG_INFO("upload failed: suffix not allowed");
+                            strcpy(m_url, "/upload.html");
+                            return true;
+                        }
+
+                        string rand_name = random_hex(8) + "_" + safe_name;
+                        string disk_path = string(doc_root) + "/uploads/" + rand_name;
+                        file_path = "/uploads/" + rand_name;
+                        file_type = get_file_type(safe_name);
+
+                        LOG_INFO("upload disk path=%s", disk_path.c_str());
+                        LOG_INFO("upload url path=%s", file_path.c_str());
+                        LOG_INFO("upload file type=%s", file_type.c_str());
+
+                        ofstream out(disk_path.c_str(), ios::binary);
+                        if (!out)
+                        {
+                            LOG_INFO("upload failed: open disk file failed");
+                            strcpy(m_url, "/upload.html");
+                            return true;
+                        }
+
+                        out.write(data.data(), data.size());
+                        out.close();
+
+                        LOG_INFO("upload file saved, size=%d", (int)data.size());
+                    }
+                }
+            }
+        }
+
+        part_pos = next_part;
+    }
+
+    LOG_INFO("upload final content_text size=%d, file_path=%s",
+             (int)content_text.size(), file_path.c_str());
+
+    if (content_text.empty() && file_path.empty())
+    {
+        LOG_INFO("upload failed: empty content and empty file");
+        strcpy(m_url, "/upload.html");
+        return true;
+    }
+
+    if (!save_post_to_db(username, content_text, file_path, file_type))
+    {
+        LOG_INFO("upload failed: save post to db failed");
+        strcpy(m_url, "/upload.html");
+        return true;
+    }
+
+    LOG_INFO("upload db saved");
+
+    if (!rebuild_community_page())
+    {
+        LOG_INFO("upload warning: rebuild community page failed");
+    }
+    else
+    {
+        LOG_INFO("upload community page rebuilt");
+    }
+
+    strcpy(m_url, "/community.html");
+    LOG_INFO("upload success, redirect to community.html");
+
+    return true;
+}
+
+
 
 //解析完整的HTTP请求后，解析请求的URL进行处理并返回响应报文
 //m_real_file:完成处理后拼接的响应资源在服务端中的完整路径
@@ -546,6 +1006,30 @@ http_conn::HTTP_CODE http_conn::do_request()
     int len = strlen(doc_root);
     //printf("m_url:%s\n", m_url);
     const char *p = strrchr(m_url, '/');
+    if (cgi == 1 && strcmp(m_url, "/upload") == 0)
+    {
+        handle_upload();
+
+        strcpy(m_real_file, doc_root);
+        int upload_len = strlen(doc_root);
+        strncpy(m_real_file + upload_len, m_url, FILENAME_LEN - upload_len - 1);
+
+        if (stat(m_real_file, &m_file_stat) < 0)
+            return NO_RESOURCE;
+
+        if (!(m_file_stat.st_mode & S_IROTH))
+            return FORBIDDEN_REQUEST;
+
+        if (S_ISDIR(m_file_stat.st_mode))
+            return BAD_REQUEST;
+
+        int fd = open(m_real_file, O_RDONLY);
+        m_file_address = (char *)mmap(0, m_file_stat.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        close(fd);
+
+        return FILE_REQUEST;
+    }
+
 
     //2. 处理登录/注册请求（消息体中都会有用户名和密码）
     //处理cgi：POST请求会将cgi置为1
@@ -629,21 +1113,30 @@ http_conn::HTTP_CODE http_conn::do_request()
 
 
     }
-    bool need_login = false;
+bool need_login = false;
 
-    if (strcmp(m_url, "/welcome.html") == 0 ||
-        *(p + 1) == '5' ||
-        *(p + 1) == '6' ||
-        *(p + 1) == '7')
-    {
-        need_login = true;
-    }
+if (strcmp(m_url, "/welcome.html") == 0 ||
+    strcmp(m_url, "/upload.html") == 0 ||
+    strcmp(m_url, "/community.html") == 0 ||
+    strcmp(m_url, "/upload") == 0 ||
+    strncmp(m_url, "/uploads/", 9) == 0 ||
+    *(p + 1) == '5' ||
+    *(p + 1) == '6' ||
+    *(p + 1) == '7')
+{
+    need_login = true;
+}
 
-    if (need_login && !check_session(m_cookie))
+
+
+    // 如果本次请求刚刚登录成功，m_set_cookie_sid 不为空，说明服务端已经创建了新 session。
+// 这时候浏览器还没来得及在当前请求里携带 Cookie，所以不能再用 m_cookie 拦截本次请求。
+    if (need_login && m_set_cookie_sid.empty() && !check_session(m_cookie))
     {
         strcpy(m_url, "/log.html");
         p = strrchr(m_url, '/');
     }
+
 
     //3. 处理跳转到注册界面的请求
     if (*(p + 1) == '0')
@@ -736,8 +1229,16 @@ http_conn::HTTP_CODE http_conn::process_read()
         text = get_line();
         m_start_line = m_checked_idx;//更新为下一行的起始位置，方便下次调用get_line获取当前行的字符串
 
-        string safe_text = sanitize_log_text(text);
-        LOG_INFO("%s", safe_text.c_str());
+        if (m_check_state == CHECK_STATE_CONTENT)
+        {
+            LOG_INFO("request body masked, content_length=%d", m_content_length);
+        }
+        else
+        {
+            string safe_text = sanitize_log_text(text);
+            LOG_INFO("%s", safe_text.c_str());
+        }
+
 
 
         //主状态机根据当前状态机状态进行报文解析
@@ -766,15 +1267,19 @@ http_conn::HTTP_CODE http_conn::process_read()
         }
         //3. 解析请求内容
         case CHECK_STATE_CONTENT:
-        {
-            ret = parse_content(text);
-            //------------------------------
-            if(ret == GET_REQUEST){
-                return do_request();
-            }
-            line_status = LINE_OPEN;//从状态机状态转为允许继续读取数据
-            break;
-        }
+{
+    ret = parse_content(text);
+
+    if (ret == GET_REQUEST)
+    {
+        return do_request();
+    }
+
+    // POST 请求体，尤其是 multipart/form-data 图片/视频上传体，
+    // 不能继续交给 parse_line() 按行解析，否则 \r\n 会被改成 \0\0，导致二进制请求体被破坏。
+    return NO_REQUEST;
+}
+
         default:
             return INTERNAL_ERROR;
         }
@@ -796,16 +1301,34 @@ bool http_conn::read_once()
 
     //将数据读到m_read_buf + m_read_idx位置开始的内存中（存在读缓冲区m_read_buf中）
     //LT方式读取数据：epoll_wait会多次通知读数据，直到读完，所以这里不用while循环
-    if(m_TRIGMode == 0){
-        bytes_read = recv(m_sockfd, m_read_buf + m_read_idx, READ_BUFFER_SIZE - m_read_idx, 0);//bytes_read代表收到的字节数,char型的buff一位也代表一个字节
-        m_read_idx += bytes_read;
+    if (m_TRIGMode == 0)
+{
+    while (true)
+    {
+        bytes_read = recv(m_sockfd, m_read_buf + m_read_idx,
+                          READ_BUFFER_SIZE - m_read_idx, 0);
 
-        if(bytes_read <= 0){//读取失败
+        if (bytes_read == -1)
+        {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                break;
+
+            return false;
+        }
+        else if (bytes_read == 0)
+        {
             return false;
         }
 
-        return true;
+        m_read_idx += bytes_read;
+
+        if (m_read_idx >= READ_BUFFER_SIZE)
+            break;
     }
+
+    return true;
+}
+
     //ET方式读取数据：epoll_wait只通知一次读数据，所以这里要用while循环读完
     else{
         while(true){
