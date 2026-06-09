@@ -111,6 +111,28 @@ Set-Cookie: sid=...; Max-Age=1800; HttpOnly; SameSite=Lax
 视频：mp4、webm
 文本：txt
 
+### 2026-06-08：上传接口增加 CSRF Token 校验
+
+修改原因：
+
+- 项目已经使用 Cookie + Session 实现登录态。
+- Cookie 会被浏览器自动携带。
+- 如果用户登录后访问恶意网站，恶意网站可能伪造表单请求 `/upload`。
+- 因此对发布内容这种敏感 POST 操作增加 CSRF Token 校验。
+
+实现方式：
+
+- 登录成功时，服务端为 session 生成随机 `csrf_token`。
+- 服务端保存 `sid -> username / csrf_token / expire_time`。
+- 响应中返回两个 Cookie：
+  - `sid`：HttpOnly，用于登录态。
+  - `csrf_token`：供前端读取并写入隐藏表单字段。
+- `upload.html` 提交时携带隐藏字段 `csrf_token`。
+- `/upload` 处理时，服务端校验表单中的 token 是否和 session 中保存的一致。
+- 校验失败则拒绝上传。
+
+
+
 
 
 

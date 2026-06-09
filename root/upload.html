@@ -8,6 +8,8 @@
     <h2>发布内容</h2>
 
     <form action="/upload" method="post" enctype="multipart/form-data">
+        <input type="hidden" name="csrf_token" id="csrf_token">
+
         <p>文字内容：</p>
         <textarea name="content" rows="6" cols="60" placeholder="写点文字..."></textarea>
 
@@ -20,6 +22,20 @@
 
     <p><a href="/community.html">查看大家发布的内容</a></p>
     <p><a href="/welcome.html">返回首页</a></p>
+
+    <script>
+        function getCookie(name) {
+            const parts = document.cookie.split(';');
+            for (let i = 0; i < parts.length; i++) {
+                const item = parts[i].trim();
+                if (item.indexOf(name + '=') === 0) {
+                    return item.substring(name.length + 1);
+                }
+            }
+            return '';
+        }
+
+        document.getElementById('csrf_token').value = getCookie('csrf_token');
+    </script>
 </body>
 </html>
-

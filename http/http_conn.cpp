@@ -158,8 +158,10 @@ static string html_escape(const string &src)
 struct session_data
 {
     string username;
+    string csrf_token;
     time_t expire_time;
 };
+
 
 static locker session_lock;
 static map<string, session_data> sessions;
@@ -189,11 +191,14 @@ static string random_hex(size_t bytes)
 static string create_session(const string &username)
 {
     string sid = random_hex(32);
-    if (sid.empty())
+    string csrf_token = random_hex(32);
+
+    if (sid.empty() || csrf_token.empty())
         return "";
 
     session_data data;
     data.username = username;
+    data.csrf_token = csrf_token;
     data.expire_time = time(NULL) + SESSION_EXPIRE_SECONDS;
 
     session_lock.lock();
@@ -203,26 +208,33 @@ static string create_session(const string &username)
     return sid;
 }
 
-static string get_sid_from_cookie(const char *cookie)
+
+static string get_cookie_value(const char *cookie, const string &key)
 {
     if (cookie == NULL)
         return "";
 
     string cookies(cookie);
-    string key = "sid=";
+    string target = key + "=";
 
-    size_t pos = cookies.find(key);
+    size_t pos = cookies.find(target);
     if (pos == string::npos)
         return "";
 
-    pos += key.size();
-    size_t end = cookies.find(';', pos);
+    pos += target.size();
 
+    size_t end = cookies.find(';', pos);
     if (end == string::npos)
         return cookies.substr(pos);
 
     return cookies.substr(pos, end - pos);
 }
+
+static string get_sid_from_cookie(const char *cookie)
+{
+    return get_cookie_value(cookie, "sid");
+}
+
 
 static bool check_session(const char *cookie)
 {
@@ -282,6 +294,34 @@ static string get_session_username(const char *cookie)
     return username;
 }
 
+static string get_session_csrf_token(const char *cookie)
+{
+    string sid = get_sid_from_cookie(cookie);
+    if (sid.empty())
+        return "";
+
+    string csrf_token;
+    time_t now = time(NULL);
+
+    session_lock.lock();
+
+    map<string, session_data>::iterator it = sessions.find(sid);
+    if (it != sessions.end())
+    {
+        if (it->second.expire_time > now)
+        {
+            csrf_token = it->second.csrf_token;
+        }
+        else
+        {
+            sessions.erase(it);
+        }
+    }
+
+    session_lock.unlock();
+
+    return csrf_token;
+}
 
 
 //prepared statement
@@ -852,6 +892,8 @@ bool http_conn::handle_upload()
     string content_text;
     string file_path;
     string file_type;
+    string csrf_token_from_form;
+
 
     size_t part_pos = 0;
 
@@ -901,11 +943,16 @@ bool http_conn::handle_upload()
         string data = body.substr(data_start, data_end - data_start);
         LOG_INFO("upload part data size=%d", (int)data.size());
 
-        if (header.find("name=\"content\"") != string::npos)
-        {
-            content_text = data;
-            LOG_INFO("upload content text size=%d", (int)content_text.size());
-        }
+      if (header.find("name=\"csrf_token\"") != string::npos)
+{
+    csrf_token_from_form = data;
+    LOG_INFO("upload csrf token received");
+}
+else if (header.find("name=\"content\"") != string::npos)
+{
+    content_text = data;
+    LOG_INFO("upload content text size=%d", (int)content_text.size());
+}
         else if (header.find("name=\"file\"") != string::npos)
         {
             size_t filename_pos = header.find("filename=\"");
@@ -962,6 +1009,19 @@ bool http_conn::handle_upload()
 
     LOG_INFO("upload final content_text size=%d, file_path=%s",
              (int)content_text.size(), file_path.c_str());
+
+
+    string csrf_token_in_session = get_session_csrf_token(m_cookie);
+
+if (csrf_token_from_form.empty() ||
+    csrf_token_in_session.empty() ||
+    csrf_token_from_form != csrf_token_in_session)
+{
+    LOG_INFO("upload failed: csrf token invalid");
+    strcpy(m_url, "/upload.html");
+    return true;
+}
+
 
     if (content_text.empty() && file_path.empty())
     {
@@ -1470,10 +1530,29 @@ bool http_conn::add_session_cookie()
     if (m_set_cookie_sid.empty())
         return true;
 
-    return add_response("Set-Cookie:sid=%s; Max-Age=%d; HttpOnly; SameSite=Lax\r\n",
+    string csrf_token;
+
+    session_lock.lock();
+
+    map<string, session_data>::iterator it = sessions.find(m_set_cookie_sid);
+    if (it != sessions.end())
+        csrf_token = it->second.csrf_token;
+
+    session_lock.unlock();
+
+    if (csrf_token.empty())
+        return add_response("Set-Cookie:sid=%s; Max-Age=%d; HttpOnly; SameSite=Lax\r\n",
+                            m_set_cookie_sid.c_str(),
+                            SESSION_EXPIRE_SECONDS);
+
+    return add_response("Set-Cookie:sid=%s; Max-Age=%d; HttpOnly; SameSite=Lax\r\n"
+                        "Set-Cookie:csrf_token=%s; Max-Age=%d; SameSite=Lax\r\n",
                         m_set_cookie_sid.c_str(),
+                        SESSION_EXPIRE_SECONDS,
+                        csrf_token.c_str(),
                         SESSION_EXPIRE_SECONDS);
 }
+
 
 bool http_conn::add_blank_line()
 {
