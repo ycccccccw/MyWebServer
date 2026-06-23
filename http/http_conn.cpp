@@ -21,9 +21,39 @@ const char *error_404_title = "Not Found";
 const char *error_404_form = "The requested file was not found on this server.\n";
 const char *error_500_title = "Internal Error";
 const char *error_500_form = "There was an unusual problem serving the request file.\n";
+const char *error_429_title = "Too Many Requests";
+const char *error_429_form = "Too many requests. Please try again later.\n";
 
 locker m_lock;
 map<string, string> users;//存储数据库中所有已注册用户的用户名和密码（在程序启动时就先提前全部取出）
+struct token_bucket
+{
+    double tokens;
+    double capacity;
+    double refill_rate;
+    time_t last_refill_time;
+};
+
+struct login_fail_info
+{
+    int fail_count;
+    time_t first_fail_time;
+    time_t blocked_until;
+};
+
+static locker rate_limit_lock;
+static map<string, token_bucket> rate_limit_buckets;
+
+static locker login_fail_lock;
+static map<string, login_fail_info> login_fail_records;
+
+static const int MAX_UPLOAD_BODY_SIZE = 1024 * 512;
+static const int LOGIN_FAIL_WINDOW_SECONDS = 5 * 60;
+static const int LOGIN_FAIL_BLOCK_SECONDS = 5 * 60;
+static const int LOGIN_FAIL_MAX_COUNT = 5;
+
+const char *error_429_title = "Too Many Requests";
+const char *error_429_form = "Too many requests. Please try again later.\n";
 static string to_lower_copy(const string &src)
 {
     string dst = src;
@@ -153,8 +183,76 @@ static string html_escape(const string &src)
 
     return out;
 }
+struct token_bucket
+{
+    double tokens;
+    double capacity;
+    double refill_rate;
+    time_t last_refill_time;
+};
 
+static locker rate_limit_lock;
+static map<string, token_bucket> rate_limit_buckets;
 
+static const int MAX_UPLOAD_BODY_SIZE = 1024 * 512;
+
+static bool allow_by_token_bucket(const string &key, double capacity, double refill_rate)
+{
+    time_t now = time(NULL);
+
+    rate_limit_lock.lock();
+
+    token_bucket &bucket = rate_limit_buckets[key];
+
+    if (bucket.capacity == 0)
+    {
+        bucket.capacity = capacity;
+        bucket.tokens = capacity;
+        bucket.refill_rate = refill_rate;
+        bucket.last_refill_time = now;
+    }
+
+    double elapsed = difftime(now, bucket.last_refill_time);
+    if (elapsed > 0)
+    {
+        bucket.tokens += elapsed * bucket.refill_rate;
+        if (bucket.tokens > bucket.capacity)
+            bucket.tokens = bucket.capacity;
+
+        bucket.last_refill_time = now;
+    }
+
+    bool allowed = false;
+    if (bucket.tokens >= 1.0)
+    {
+        bucket.tokens -= 1.0;
+        allowed = true;
+    }
+
+    rate_limit_lock.unlock();
+
+    return allowed;
+}
+
+static bool allow_request_by_path(const string &client_ip, const string &url)
+{
+    if (url == "/upload")
+    {
+        return allow_by_token_bucket("upload_ip:" + client_ip, 1, 1.0 / 60.0);
+    }
+
+    if (url == "/community.html")
+    {
+        return allow_by_token_bucket("community_ip:" + client_ip, 20, 2.0);
+    }
+
+    if (url.find("/uploads/") == 0)
+    {
+        return allow_by_token_bucket("uploads_ip:" + client_ip, 60, 6.0);
+    }
+
+    return allow_by_token_bucket("normal_ip:" + client_ip, 50, 5.0);
+}
 struct session_data
 {
     string username;
@@ -1066,9 +1164,31 @@ http_conn::HTTP_CODE http_conn::do_request()
     int len = strlen(doc_root);
     //printf("m_url:%s\n", m_url);
     const char *p = strrchr(m_url, '/');
-    if (cgi == 1 && strcmp(m_url, "/upload") == 0)
+   string client_ip = inet_ntoa(m_address.sin_addr);
+string current_url = m_url ? string(m_url) : "";
+
+if (!allow_request_by_path(client_ip, current_url))
+{
+    LOG_INFO("rate limit rejected, ip=%s, url=%s",
+             client_ip.c_str(), current_url.c_str());
+    return TOO_MANY_REQUESTS;
+}
+   if (cgi == 1 && strcmp(m_url, "/upload") == 0)
+{
+    if (m_content_length > MAX_UPLOAD_BODY_SIZE)
     {
-        handle_upload();
+        LOG_INFO("upload rejected: body too large, content_length=%d", m_content_length);
+        return TOO_MANY_REQUESTS;
+    }
+
+    handle_upload();
+
+    char *m_url_real = (char *)malloc(sizeof(char) * 200);
+    strcpy(m_url_real, "/community.html");
+    strncpy(m_real_file + len, m_url_real, strlen(m_url_real));
+
+    free(m_url_real);
+}
 
         strcpy(m_real_file, doc_root);
         int upload_len = strlen(doc_root);
@@ -1147,25 +1267,37 @@ http_conn::HTTP_CODE http_conn::do_request()
             }
         }
         else if (*(p + 1) == '2')
-        {
-            if (users.find(name) != users.end() &&
-                password_hash::verify_password(password, users[name]))
-            {
-                m_login_user = name;
-                m_set_cookie_sid = create_session(m_login_user);
+{
+    string login_ip_key = "login_fail_ip:" + client_ip;
+    string login_user_key = string("login_fail_user:") + name;
 
-                if (!m_set_cookie_sid.empty())
-                    strcpy(m_url, "/welcome.html");
-                else
-                    strcpy(m_url, "/logError.html");
-            }
-            else
-            {
-                strcpy(m_url, "/logError.html");
-            }
-        }
+    if (is_login_blocked(login_ip_key) || is_login_blocked(login_user_key))
+    {
+        LOG_INFO("login blocked by fail limit, user=%s, ip=%s", name, client_ip.c_str());
+        strcpy(m_url, "/logError.html");
     }
+    else if (users.find(name) != users.end() &&
+             password_hash::verify_password(password, users[name]))
+    {
+        clear_login_fail(login_ip_key);
+        clear_login_fail(login_user_key);
 
+        m_login_user = name;
+        m_set_cookie_sid = create_session(m_login_user);
+
+        if (!m_set_cookie_sid.empty())
+            strcpy(m_url, "/welcome.html");
+        else
+            strcpy(m_url, "/logError.html");
+    }
+    else
+    {
+        record_login_fail(login_ip_key);
+        record_login_fail(login_user_key);
+
+        strcpy(m_url, "/logError.html");
+    }
+}
    
 bool need_login = false;
 
@@ -1563,6 +1695,14 @@ bool http_conn::process_write(HTTP_CODE ret)
 {
     switch (ret)
     {
+        case TOO_MANY_REQUESTS:
+    {
+        add_status_line(429, error_429_title);
+        add_headers(strlen(error_429_form));
+        if (!add_content(error_429_form))
+            return false;
+        break;
+    }
     //1. 服务器内部错误：500
     //在主状态机switch-case出现的错误，一般不会触发
     case INTERNAL_ERROR:
