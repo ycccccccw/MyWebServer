@@ -182,6 +182,135 @@ static string html_escape(const string &src)
     return out;
 }
 
+static bool allow_by_token_bucket(const string &key, double capacity, double refill_rate)
+{
+    time_t now = time(NULL);
+
+    rate_limit_lock.lock();
+
+    token_bucket &bucket = rate_limit_buckets[key];
+
+    if (bucket.capacity == 0)
+    {
+        bucket.capacity = capacity;
+        bucket.tokens = capacity;
+        bucket.refill_rate = refill_rate;
+        bucket.last_refill_time = now;
+    }
+
+    double elapsed = difftime(now, bucket.last_refill_time);
+    if (elapsed > 0)
+    {
+        bucket.tokens += elapsed * bucket.refill_rate;
+        if (bucket.tokens > bucket.capacity)
+            bucket.tokens = bucket.capacity;
+
+        bucket.last_refill_time = now;
+    }
+
+    bool allowed = false;
+
+    if (bucket.tokens >= 1.0)
+    {
+        bucket.tokens -= 1.0;
+        allowed = true;
+    }
+
+    rate_limit_lock.unlock();
+
+    return allowed;
+}
+
+static bool allow_request_by_path(const string &client_ip, const string &url)
+{
+    if (url == "/upload")
+    {
+        return allow_by_token_bucket("upload_ip:" + client_ip, 1, 1.0 / 60.0);
+    }
+
+    if (url == "/community.html")
+    {
+        return allow_by_token_bucket("community_ip:" + client_ip, 20, 2.0);
+    }
+
+    if (url.find("/uploads/") == 0)
+    {
+        return allow_by_token_bucket("uploads_ip:" + client_ip, 60, 6.0);
+    }
+
+    if (url.find("/2") == 0)
+    {
+        return allow_by_token_bucket("login_ip:" + client_ip, 10, 1.0 / 6.0);
+    }
+
+    if (url.find("/3") == 0)
+    {
+        return allow_by_token_bucket("register_ip:" + client_ip, 5, 1.0 / 12.0);
+    }
+
+    return allow_by_token_bucket("normal_ip:" + client_ip, 50, 5.0);
+}
+
+static bool is_login_blocked(const string &key)
+{
+    time_t now = time(NULL);
+
+    login_fail_lock.lock();
+
+    map<string, login_fail_info>::iterator it = login_fail_records.find(key);
+
+    bool blocked = false;
+
+    if (it != login_fail_records.end())
+    {
+        if (it->second.blocked_until > now)
+        {
+            blocked = true;
+        }
+        else if (it->second.blocked_until != 0 && it->second.blocked_until <= now)
+        {
+            login_fail_records.erase(it);
+        }
+    }
+
+    login_fail_lock.unlock();
+
+    return blocked;
+}
+
+static void record_login_fail(const string &key)
+{
+    time_t now = time(NULL);
+
+    login_fail_lock.lock();
+
+    login_fail_info &info = login_fail_records[key];
+
+    if (info.first_fail_time == 0 || now - info.first_fail_time > LOGIN_FAIL_WINDOW_SECONDS)
+    {
+        info.first_fail_time = now;
+        info.fail_count = 1;
+        info.blocked_until = 0;
+    }
+    else
+    {
+        info.fail_count++;
+    }
+
+    if (info.fail_count >= LOGIN_FAIL_MAX_COUNT)
+    {
+        info.blocked_until = now + LOGIN_FAIL_BLOCK_SECONDS;
+    }
+
+    login_fail_lock.unlock();
+}
+
+static void clear_login_fail(const string &key)
+{
+    login_fail_lock.lock();
+    login_fail_records.erase(key);
+    login_fail_lock.unlock();
+}
 
 struct session_data
 {
@@ -1094,9 +1223,24 @@ http_conn::HTTP_CODE http_conn::do_request()
     int len = strlen(doc_root);
     //printf("m_url:%s\n", m_url);
     const char *p = strrchr(m_url, '/');
+        string client_ip = inet_ntoa(m_address.sin_addr);
+string current_url = m_url ? string(m_url) : "";
+
+if (!allow_request_by_path(client_ip, current_url))
+{
+    LOG_INFO("rate limit rejected, ip=%s, url=%s",
+             client_ip.c_str(), current_url.c_str());
+    return TOO_MANY_REQUESTS;
+}
     if (cgi == 1 && strcmp(m_url, "/upload") == 0)
+{
+    if (m_content_length > MAX_UPLOAD_BODY_SIZE)
     {
-        handle_upload();
+        LOG_INFO("upload rejected: body too large, content_length=%d", m_content_length);
+        return TOO_MANY_REQUESTS;
+    }
+
+    handle_upload();
 
         strcpy(m_real_file, doc_root);
         int upload_len = strlen(doc_root);
@@ -1180,13 +1324,38 @@ http_conn::HTTP_CODE http_conn::do_request()
         }
     }
 
-    else if (*(p + 1) == '2')
+  else if (*(p + 1) == '2')
 {
-    if (users.find(name) != users.end() &&
-        password_hash::verify_password(password, users[name]))
+    string login_ip_key = "login_fail_ip:" + client_ip;
+    string login_user_key = string("login_fail_user:") + name;
+
+    if (is_login_blocked(login_ip_key) || is_login_blocked(login_user_key))
     {
+        LOG_INFO("login blocked by fail limit, user=%s, ip=%s", name, client_ip.c_str());
+        strcpy(m_url, "/logError.html");
+    }
+    else if (users.find(name) != users.end() &&
+             password_hash::verify_password(password, users[name]))
+    {
+        clear_login_fail(login_ip_key);
+        clear_login_fail(login_user_key);
+
         m_login_user = name;
         m_set_cookie_sid = create_session(m_login_user);
+
+        if (!m_set_cookie_sid.empty())
+            strcpy(m_url, "/welcome.html");
+        else
+            strcpy(m_url, "/logError.html");
+    }
+    else
+    {
+        record_login_fail(login_ip_key);
+        record_login_fail(login_user_key);
+
+        strcpy(m_url, "/logError.html");
+    }
+}
 
         if (!m_set_cookie_sid.empty())
             strcpy(m_url, "/welcome.html");
@@ -1200,7 +1369,7 @@ http_conn::HTTP_CODE http_conn::do_request()
 }
 
 
-    }
+    
 bool need_login = false;
 
 if (strcmp(m_url, "/welcome.html") == 0 ||
@@ -1597,6 +1766,14 @@ bool http_conn::process_write(HTTP_CODE ret)
 {
     switch (ret)
     {
+    case TOO_MANY_REQUESTS:
+    {
+        add_status_line(429, error_429_title);
+        add_headers(strlen(error_429_form));
+        if (!add_content(error_429_form))
+            return false;
+        break;
+    }
     //1. 服务器内部错误：500
     //在主状态机switch-case出现的错误，一般不会触发
     case INTERNAL_ERROR:
@@ -1651,6 +1828,7 @@ bool http_conn::process_write(HTTP_CODE ret)
                 return false;
         }
     }
+    
     default:
         return false;
     }
