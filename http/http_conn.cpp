@@ -26,34 +26,6 @@ const char *error_429_form = "Too many requests. Please try again later.\n";
 
 locker m_lock;
 map<string, string> users;//存储数据库中所有已注册用户的用户名和密码（在程序启动时就先提前全部取出）
-struct token_bucket
-{
-    double tokens;
-    double capacity;
-    double refill_rate;
-    time_t last_refill_time;
-};
-
-struct login_fail_info
-{
-    int fail_count;
-    time_t first_fail_time;
-    time_t blocked_until;
-};
-
-static locker rate_limit_lock;
-static map<string, token_bucket> rate_limit_buckets;
-
-static locker login_fail_lock;
-static map<string, login_fail_info> login_fail_records;
-
-static const int MAX_UPLOAD_BODY_SIZE = 1024 * 512;
-static const int LOGIN_FAIL_WINDOW_SECONDS = 5 * 60;
-static const int LOGIN_FAIL_BLOCK_SECONDS = 5 * 60;
-static const int LOGIN_FAIL_MAX_COUNT = 5;
-
-const char *error_429_title = "Too Many Requests";
-const char *error_429_form = "Too many requests. Please try again later.\n";
 static string to_lower_copy(const string &src)
 {
     string dst = src;
@@ -1159,61 +1131,36 @@ if (csrf_token_from_form.empty() ||
 //m_string   :POST请求中在parse_content()中解析出的消息体（包含用户名和密码）
 http_conn::HTTP_CODE http_conn::do_request()
 {
-    //1. 将m_real_file初始化为项目的根目录（WebServer类中初始化过的root）
     strcpy(m_real_file, doc_root);
     int len = strlen(doc_root);
-    //printf("m_url:%s\n", m_url);
     const char *p = strrchr(m_url, '/');
-   string client_ip = inet_ntoa(m_address.sin_addr);
-string current_url = m_url ? string(m_url) : "";
 
-if (!allow_request_by_path(client_ip, current_url))
-{
-    LOG_INFO("rate limit rejected, ip=%s, url=%s",
-             client_ip.c_str(), current_url.c_str());
-    return TOO_MANY_REQUESTS;
-}
-   if (cgi == 1 && strcmp(m_url, "/upload") == 0)
-{
-    if (m_content_length > MAX_UPLOAD_BODY_SIZE)
+    string client_ip = inet_ntoa(m_address.sin_addr);
+    string current_url = m_url ? string(m_url) : "";
+
+    if (!allow_request_by_path(client_ip, current_url))
     {
-        LOG_INFO("upload rejected: body too large, content_length=%d", m_content_length);
+        LOG_INFO("rate limit rejected, ip=%s, url=%s",
+                 client_ip.c_str(), current_url.c_str());
         return TOO_MANY_REQUESTS;
     }
 
-    handle_upload();
+    if (cgi == 1 && strcmp(m_url, "/upload") == 0)
+    {
+        if (m_content_length > MAX_UPLOAD_BODY_SIZE)
+        {
+            LOG_INFO("upload rejected: body too large, content_length=%d", m_content_length);
+            return TOO_MANY_REQUESTS;
+        }
 
-    char *m_url_real = (char *)malloc(sizeof(char) * 200);
-    strcpy(m_url_real, "/community.html");
-    strncpy(m_real_file + len, m_url_real, strlen(m_url_real));
+        handle_upload();
 
-    free(m_url_real);
-}
-
-        strcpy(m_real_file, doc_root);
-        int upload_len = strlen(doc_root);
-        strncpy(m_real_file + upload_len, m_url, FILENAME_LEN - upload_len - 1);
-
-        if (stat(m_real_file, &m_file_stat) < 0)
-            return NO_RESOURCE;
-
-        if (!(m_file_stat.st_mode & S_IROTH))
-            return FORBIDDEN_REQUEST;
-
-        if (S_ISDIR(m_file_stat.st_mode))
-            return BAD_REQUEST;
-
-        int fd = open(m_real_file, O_RDONLY);
-        m_file_address = (char *)mmap(0, m_file_stat.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-        close(fd);
-
-        return FILE_REQUEST;
+        char *m_url_real = (char *)malloc(sizeof(char) * 200);
+        strcpy(m_url_real, "/community.html");
+        strncpy(m_real_file + len, m_url_real, strlen(m_url_real));
+        free(m_url_real);
     }
-
-
-    //2. 处理登录/注册请求（消息体中都会有用户名和密码）
-    //处理cgi：POST请求会将cgi置为1
-        if (cgi == 1 && (*(p + 1) == '2' || *(p + 1) == '3'))
+    else if (cgi == 1 && (*(p + 1) == '2' || *(p + 1) == '3'))
     {
         char flag = m_url[1];
 
@@ -1267,128 +1214,96 @@ if (!allow_request_by_path(client_ip, current_url))
             }
         }
         else if (*(p + 1) == '2')
-{
-    string login_ip_key = "login_fail_ip:" + client_ip;
-    string login_user_key = string("login_fail_user:") + name;
+        {
+            if (users.find(name) != users.end() &&
+                password_hash::verify_password(password, users[name]))
+            {
+                m_login_user = name;
+                m_set_cookie_sid = create_session(m_login_user);
 
-    if (is_login_blocked(login_ip_key) || is_login_blocked(login_user_key))
-    {
-        LOG_INFO("login blocked by fail limit, user=%s, ip=%s", name, client_ip.c_str());
-        strcpy(m_url, "/logError.html");
+                if (!m_set_cookie_sid.empty())
+                    strcpy(m_url, "/welcome.html");
+                else
+                    strcpy(m_url, "/logError.html");
+            }
+            else
+            {
+                strcpy(m_url, "/logError.html");
+            }
+        }
     }
-    else if (users.find(name) != users.end() &&
-             password_hash::verify_password(password, users[name]))
+
+    p = strrchr(m_url, '/');
+
+    bool need_login = false;
+
+    if (strcmp(m_url, "/welcome.html") == 0 ||
+        strcmp(m_url, "/upload.html") == 0 ||
+        strcmp(m_url, "/community.html") == 0 ||
+        strcmp(m_url, "/upload") == 0 ||
+        strncmp(m_url, "/uploads/", 9) == 0 ||
+        *(p + 1) == '5' ||
+        *(p + 1) == '6' ||
+        *(p + 1) == '7')
     {
-        clear_login_fail(login_ip_key);
-        clear_login_fail(login_user_key);
-
-        m_login_user = name;
-        m_set_cookie_sid = create_session(m_login_user);
-
-        if (!m_set_cookie_sid.empty())
-            strcpy(m_url, "/welcome.html");
-        else
-            strcpy(m_url, "/logError.html");
+        need_login = true;
     }
-    else
-    {
-        record_login_fail(login_ip_key);
-        record_login_fail(login_user_key);
 
-        strcpy(m_url, "/logError.html");
-    }
-}
-   
-bool need_login = false;
-
-if (strcmp(m_url, "/welcome.html") == 0 ||
-    strcmp(m_url, "/upload.html") == 0 ||
-    strcmp(m_url, "/community.html") == 0 ||
-    strcmp(m_url, "/upload") == 0 ||
-    strncmp(m_url, "/uploads/", 9) == 0 ||
-    *(p + 1) == '5' ||
-    *(p + 1) == '6' ||
-    *(p + 1) == '7')
-{
-    need_login = true;
-}
-
-
-
-    // 如果本次请求刚刚登录成功，m_set_cookie_sid 不为空，说明服务端已经创建了新 session。
-// 这时候浏览器还没来得及在当前请求里携带 Cookie，所以不能再用 m_cookie 拦截本次请求。
     if (need_login && m_set_cookie_sid.empty() && !check_session(m_cookie))
     {
         strcpy(m_url, "/log.html");
         p = strrchr(m_url, '/');
     }
 
-
-    //3. 处理跳转到注册界面的请求
     if (*(p + 1) == '0')
     {
         char *m_url_real = (char *)malloc(sizeof(char) * 200);
         strcpy(m_url_real, "/register.html");
         strncpy(m_real_file + len, m_url_real, strlen(m_url_real));
-
         free(m_url_real);
     }
-
-    //4. 处理跳转到登录界面的请求
     else if (*(p + 1) == '1')
     {
         char *m_url_real = (char *)malloc(sizeof(char) * 200);
         strcpy(m_url_real, "/log.html");
         strncpy(m_real_file + len, m_url_real, strlen(m_url_real));
-
         free(m_url_real);
     }
-
-    //5. 处理图片资源请求
     else if (*(p + 1) == '5')
     {
         char *m_url_real = (char *)malloc(sizeof(char) * 200);
         strcpy(m_url_real, "/picture.html");
         strncpy(m_real_file + len, m_url_real, strlen(m_url_real));
-
         free(m_url_real);
     }
-
-    //6. 处理视频资源请求
     else if (*(p + 1) == '6')
     {
         char *m_url_real = (char *)malloc(sizeof(char) * 200);
         strcpy(m_url_real, "/video.html");
         strncpy(m_real_file + len, m_url_real, strlen(m_url_real));
-
         free(m_url_real);
     }
-
-    //7. 处理关注界面的请求
     else if (*(p + 1) == '7')
     {
         char *m_url_real = (char *)malloc(sizeof(char) * 200);
         strcpy(m_url_real, "/fans.html");
         strncpy(m_real_file + len, m_url_real, strlen(m_url_real));
-
         free(m_url_real);
     }
     else
+    {
         strncpy(m_real_file + len, m_url, FILENAME_LEN - len - 1);
+    }
 
-    //判断该路径的文件是否存在
     if (stat(m_real_file, &m_file_stat) < 0)
         return NO_RESOURCE;
 
-    //判断文件的权限是否可读
     if (!(m_file_stat.st_mode & S_IROTH))
         return FORBIDDEN_REQUEST;
 
-    //判断请求的资源是文件夹还是文件（文件夹返回BAD_REQUEST，不可响应）
     if (S_ISDIR(m_file_stat.st_mode))
         return BAD_REQUEST;
 
-    //通过mmap将资源文件映射到内存中，提高文件的访问速度
     int fd = open(m_real_file, O_RDONLY);
     m_file_address = (char *)mmap(0, m_file_stat.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
