@@ -24,6 +24,34 @@ const char *error_500_form = "There was an unusual problem serving the request f
 
 locker m_lock;
 map<string, string> users;//存储数据库中所有已注册用户的用户名和密码（在程序启动时就先提前全部取出）
+struct token_bucket
+{
+    double tokens;
+    double capacity;
+    double refill_rate;
+    time_t last_refill_time;
+};
+
+struct login_fail_info
+{
+    int fail_count;
+    time_t first_fail_time;
+    time_t blocked_until;
+};
+
+static locker rate_limit_lock;
+static map<string, token_bucket> rate_limit_buckets;
+
+static locker login_fail_lock;
+static map<string, login_fail_info> login_fail_records;
+
+static const int MAX_UPLOAD_BODY_SIZE = 1024 * 512;
+static const int LOGIN_FAIL_WINDOW_SECONDS = 5 * 60;
+static const int LOGIN_FAIL_BLOCK_SECONDS = 5 * 60;
+static const int LOGIN_FAIL_MAX_COUNT = 5;
+
+const char *error_429_title = "Too Many Requests";
+const char *error_429_form = "Too many requests. Please try again later.\n";
 static string to_lower_copy(const string &src)
 {
     string dst = src;
