@@ -210,7 +210,7 @@ static bool allow_request_by_path(const string &client_ip, const string &url)
 {
     if (url == "/upload")
     {
-        return allow_by_token_bucket("upload_ip:" + client_ip, 1, 1.0 / 60.0);
+        return allow_by_token_bucket("upload_ip:" + client_ip, 5, 1.0 / 12.0);
     }
 
     if (url == "/community.html")
