@@ -209,22 +209,98 @@ static bool allow_by_token_bucket(const string &key, double capacity, double ref
 static bool allow_request_by_path(const string &client_ip, const string &url)
 {
     if (url == "/upload")
-    {
-        return allow_by_token_bucket("upload_ip:" + client_ip, 5, 1.0 / 12.0);
-    }
+        return allow_by_token_bucket("upload_ip:" + client_ip, 1, 1.0 / 60.0);
 
     if (url == "/community.html")
-    {
         return allow_by_token_bucket("community_ip:" + client_ip, 20, 2.0);
-    }
 
     if (url.find("/uploads/") == 0)
-    {
         return allow_by_token_bucket("uploads_ip:" + client_ip, 60, 6.0);
-    }
+
+    if (url.find("/2") == 0)
+        return allow_by_token_bucket("login_ip:" + client_ip, 10, 1.0 / 6.0);
+
+    if (url.find("/3") == 0)
+        return allow_by_token_bucket("register_ip:" + client_ip, 5, 1.0 / 12.0);
 
     return allow_by_token_bucket("normal_ip:" + client_ip, 50, 5.0);
 }
+
+struct login_fail_info
+{
+    int fail_count;
+    time_t first_fail_time;
+    time_t blocked_until;
+};
+
+static locker login_fail_lock;
+static map<string, login_fail_info> login_fail_records;
+
+static const int LOGIN_FAIL_WINDOW_SECONDS = 5 * 60;
+static const int LOGIN_FAIL_BLOCK_SECONDS = 5 * 60;
+static const int LOGIN_FAIL_MAX_COUNT = 3;
+
+static bool is_login_blocked(const string &key)
+{
+    time_t now = time(NULL);
+    bool blocked = false;
+
+    login_fail_lock.lock();
+
+    map<string, login_fail_info>::iterator it = login_fail_records.find(key);
+    if (it != login_fail_records.end())
+    {
+        if (it->second.blocked_until > now)
+        {
+            blocked = true;
+        }
+        else if (it->second.blocked_until != 0)
+        {
+            login_fail_records.erase(it);
+        }
+    }
+
+    login_fail_lock.unlock();
+
+    return blocked;
+}
+
+static void record_login_fail(const string &key)
+{
+    time_t now = time(NULL);
+
+    login_fail_lock.lock();
+
+    login_fail_info &info = login_fail_records[key];
+
+    if (info.first_fail_time == 0 || now - info.first_fail_time > LOGIN_FAIL_WINDOW_SECONDS)
+    {
+        info.fail_count = 1;
+        info.first_fail_time = now;
+        info.blocked_until = 0;
+    }
+    else
+    {
+        info.fail_count++;
+    }
+
+    if (info.fail_count >= LOGIN_FAIL_MAX_COUNT)
+    {
+        info.blocked_until = now + LOGIN_FAIL_BLOCK_SECONDS;
+        info.fail_count = 0;
+        info.first_fail_time = 0;
+    }
+
+    login_fail_lock.unlock();
+}
+
+static void clear_login_fail(const string &key)
+{
+    login_fail_lock.lock();
+    login_fail_records.erase(key);
+    login_fail_lock.unlock();
+}
+
 struct session_data
 {
     string username;
@@ -1215,9 +1291,21 @@ http_conn::HTTP_CODE http_conn::do_request()
         }
         else if (*(p + 1) == '2')
         {
-            if (users.find(name) != users.end() &&
-                password_hash::verify_password(password, users[name]))
+            string login_ip_key = "login_fail_ip:" + client_ip;
+            string login_user_key = string("login_fail_user:") + name;
+
+            if (is_login_blocked(login_ip_key) || is_login_blocked(login_user_key))
             {
+                LOG_INFO("login blocked by fail limit, user=%s, ip=%s",
+                         name, client_ip.c_str());
+                strcpy(m_url, "/lockError.html");
+            }
+            else if (users.find(name) != users.end() &&
+                     password_hash::verify_password(password, users[name]))
+            {
+                clear_login_fail(login_ip_key);
+                clear_login_fail(login_user_key);
+
                 m_login_user = name;
                 m_set_cookie_sid = create_session(m_login_user);
 
@@ -1228,7 +1316,14 @@ http_conn::HTTP_CODE http_conn::do_request()
             }
             else
             {
-                strcpy(m_url, "/logError.html");
+                record_login_fail(login_ip_key);
+                record_login_fail(login_user_key);
+                LOG_INFO("login failed, user=%s, ip=%s", name, client_ip.c_str());
+
+                if (is_login_blocked(login_ip_key) || is_login_blocked(login_user_key))
+                    strcpy(m_url, "/lockError.html");
+                else
+                    strcpy(m_url, "/logError.html");
             }
         }
     }
