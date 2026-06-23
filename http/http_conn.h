@@ -44,7 +44,18 @@ public:
     //从状态机的状态：从buff中读取一个完整的行，状态有行出错，行数据尚且不完整（LT模式下会有LINE_OPEN）等
     enum LINE_STATUS {LINE_OK = 0, LINE_BAD, LINE_OPEN};
     //主状态机解析报文的结果：有无完整的报文
-    enum HTTP_CODE {NO_REQUEST, GET_REQUEST, BAD_REQUEST, NO_RESOURCE, FORBIDDEN_REQUEST, FILE_REQUEST, INTERNAL_ERROR, CLOSED_CONNECTION};
+    enum HTTP_CODE
+{
+    NO_REQUEST,
+    GET_REQUEST,
+    BAD_REQUEST,
+    NO_RESOURCE,
+    FORBIDDEN_REQUEST,
+    FILE_REQUEST,
+    INTERNAL_ERROR,
+    CLOSED_CONNECTION,
+    TOO_MANY_REQUESTS
+};
 
 public:
     http_conn(){}

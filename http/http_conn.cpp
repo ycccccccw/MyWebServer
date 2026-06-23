@@ -24,34 +24,6 @@ const char *error_500_form = "There was an unusual problem serving the request f
 
 locker m_lock;
 map<string, string> users;//存储数据库中所有已注册用户的用户名和密码（在程序启动时就先提前全部取出）
-struct token_bucket
-{
-    double tokens;
-    double capacity;
-    double refill_rate;
-    time_t last_refill_time;
-};
-
-struct login_fail_info
-{
-    int fail_count;
-    time_t first_fail_time;
-    time_t blocked_until;
-};
-
-static locker rate_limit_lock;
-static map<string, token_bucket> rate_limit_buckets;
-
-static locker login_fail_lock;
-static map<string, login_fail_info> login_fail_records;
-
-static const int MAX_UPLOAD_BODY_SIZE = 1024 * 512;
-static const int LOGIN_FAIL_WINDOW_SECONDS = 5 * 60;
-static const int LOGIN_FAIL_BLOCK_SECONDS = 5 * 60;
-static const int LOGIN_FAIL_MAX_COUNT = 5;
-
-const char *error_429_title = "Too Many Requests";
-const char *error_429_form = "Too many requests. Please try again later.\n";
 static string to_lower_copy(const string &src)
 {
     string dst = src;
@@ -182,135 +154,6 @@ static string html_escape(const string &src)
     return out;
 }
 
-static bool allow_by_token_bucket(const string &key, double capacity, double refill_rate)
-{
-    time_t now = time(NULL);
-
-    rate_limit_lock.lock();
-
-    token_bucket &bucket = rate_limit_buckets[key];
-
-    if (bucket.capacity == 0)
-    {
-        bucket.capacity = capacity;
-        bucket.tokens = capacity;
-        bucket.refill_rate = refill_rate;
-        bucket.last_refill_time = now;
-    }
-
-    double elapsed = difftime(now, bucket.last_refill_time);
-    if (elapsed > 0)
-    {
-        bucket.tokens += elapsed * bucket.refill_rate;
-        if (bucket.tokens > bucket.capacity)
-            bucket.tokens = bucket.capacity;
-
-        bucket.last_refill_time = now;
-    }
-
-    bool allowed = false;
-
-    if (bucket.tokens >= 1.0)
-    {
-        bucket.tokens -= 1.0;
-        allowed = true;
-    }
-
-    rate_limit_lock.unlock();
-
-    return allowed;
-}
-
-static bool allow_request_by_path(const string &client_ip, const string &url)
-{
-    if (url == "/upload")
-    {
-        return allow_by_token_bucket("upload_ip:" + client_ip, 1, 1.0 / 60.0);
-    }
-
-    if (url == "/community.html")
-    {
-        return allow_by_token_bucket("community_ip:" + client_ip, 20, 2.0);
-    }
-
-    if (url.find("/uploads/") == 0)
-    {
-        return allow_by_token_bucket("uploads_ip:" + client_ip, 60, 6.0);
-    }
-
-    if (url.find("/2") == 0)
-    {
-        return allow_by_token_bucket("login_ip:" + client_ip, 10, 1.0 / 6.0);
-    }
-
-    if (url.find("/3") == 0)
-    {
-        return allow_by_token_bucket("register_ip:" + client_ip, 5, 1.0 / 12.0);
-    }
-
-    return allow_by_token_bucket("normal_ip:" + client_ip, 50, 5.0);
-}
-
-static bool is_login_blocked(const string &key)
-{
-    time_t now = time(NULL);
-
-    login_fail_lock.lock();
-
-    map<string, login_fail_info>::iterator it = login_fail_records.find(key);
-
-    bool blocked = false;
-
-    if (it != login_fail_records.end())
-    {
-        if (it->second.blocked_until > now)
-        {
-            blocked = true;
-        }
-        else if (it->second.blocked_until != 0 && it->second.blocked_until <= now)
-        {
-            login_fail_records.erase(it);
-        }
-    }
-
-    login_fail_lock.unlock();
-
-    return blocked;
-}
-
-static void record_login_fail(const string &key)
-{
-    time_t now = time(NULL);
-
-    login_fail_lock.lock();
-
-    login_fail_info &info = login_fail_records[key];
-
-    if (info.first_fail_time == 0 || now - info.first_fail_time > LOGIN_FAIL_WINDOW_SECONDS)
-    {
-        info.first_fail_time = now;
-        info.fail_count = 1;
-        info.blocked_until = 0;
-    }
-    else
-    {
-        info.fail_count++;
-    }
-
-    if (info.fail_count >= LOGIN_FAIL_MAX_COUNT)
-    {
-        info.blocked_until = now + LOGIN_FAIL_BLOCK_SECONDS;
-    }
-
-    login_fail_lock.unlock();
-}
-
-static void clear_login_fail(const string &key)
-{
-    login_fail_lock.lock();
-    login_fail_records.erase(key);
-    login_fail_lock.unlock();
-}
 
 struct session_data
 {
@@ -1223,24 +1066,9 @@ http_conn::HTTP_CODE http_conn::do_request()
     int len = strlen(doc_root);
     //printf("m_url:%s\n", m_url);
     const char *p = strrchr(m_url, '/');
-        string client_ip = inet_ntoa(m_address.sin_addr);
-string current_url = m_url ? string(m_url) : "";
-
-if (!allow_request_by_path(client_ip, current_url))
-{
-    LOG_INFO("rate limit rejected, ip=%s, url=%s",
-             client_ip.c_str(), current_url.c_str());
-    return TOO_MANY_REQUESTS;
-}
     if (cgi == 1 && strcmp(m_url, "/upload") == 0)
-{
-    if (m_content_length > MAX_UPLOAD_BODY_SIZE)
     {
-        LOG_INFO("upload rejected: body too large, content_length=%d", m_content_length);
-        return TOO_MANY_REQUESTS;
-    }
-
-    handle_upload();
+        handle_upload();
 
         strcpy(m_real_file, doc_root);
         int upload_len = strlen(doc_root);
@@ -1265,10 +1093,8 @@ if (!allow_request_by_path(client_ip, current_url))
 
     //2. 处理登录/注册请求（消息体中都会有用户名和密码）
     //处理cgi：POST请求会将cgi置为1
-    if (cgi == 1 && (*(p + 1) == '2' || *(p + 1) == '3'))
+        if (cgi == 1 && (*(p + 1) == '2' || *(p + 1) == '3'))
     {
-
-        //根据标志判断是登录检测还是注册检测（flag为"2"是登录，为"3"是注册）
         char flag = m_url[1];
 
         char *m_url_real = (char *)malloc(sizeof(char) * 200);
@@ -1277,99 +1103,70 @@ if (!allow_request_by_path(client_ip, current_url))
         strncpy(m_real_file + len, m_url_real, FILENAME_LEN - len - 1);
         free(m_url_real);
 
-        //2.1 将用户名和密码提取出来
-        //存于报文的消息体中：user=akira&password=akira
         char name[100], password[100];
-        //a. 通过识别连接符 & 确定用户名
+
         int i;
         for (i = 5; m_string[i] != '&'; ++i)
             name[i - 5] = m_string[i];
         name[i - 5] = '\0';
-        //b. 确定密码
+
         int j = 0;
         for (i = i + 10; m_string[i] != '\0'; ++i, ++j)
             password[j] = m_string[i];
         password[j] = '\0';
 
-        //2.2 处理注册请求
-    if (*(p + 1) == '3')
-{
-        string user_name(name);
-        string hashed_password = password_hash::make_password_hash(password);
-
-        if (hashed_password.empty())
+        if (*(p + 1) == '3')
         {
-            strcpy(m_url, "/registerError.html");
-        }
-        else if (users.find(user_name) == users.end())
-        {
-            m_lock.lock();
+            string user_name(name);
+            string hashed_password = password_hash::make_password_hash(password);
 
-            bool insert_ok = insert_user_by_stmt(mysql, user_name, hashed_password);
-            if (insert_ok)
+            if (hashed_password.empty())
             {
-                users.insert(pair<string, string>(user_name, hashed_password));
-            }
-
-            m_lock.unlock();
-
-            if (insert_ok)
-                strcpy(m_url, "/log.html");
-            else
                 strcpy(m_url, "/registerError.html");
+            }
+            else if (users.find(user_name) == users.end())
+            {
+                m_lock.lock();
+
+                bool insert_ok = insert_user_by_stmt(mysql, user_name, hashed_password);
+                if (insert_ok)
+                {
+                    users.insert(pair<string, string>(user_name, hashed_password));
+                }
+
+                m_lock.unlock();
+
+                if (insert_ok)
+                    strcpy(m_url, "/log.html");
+                else
+                    strcpy(m_url, "/registerError.html");
+            }
+            else
+            {
+                strcpy(m_url, "/registerError.html");
+            }
         }
-        else
+        else if (*(p + 1) == '2')
         {
-            strcpy(m_url, "/registerError.html");
+            if (users.find(name) != users.end() &&
+                password_hash::verify_password(password, users[name]))
+            {
+                m_login_user = name;
+                m_set_cookie_sid = create_session(m_login_user);
+
+                if (!m_set_cookie_sid.empty())
+                    strcpy(m_url, "/welcome.html");
+                else
+                    strcpy(m_url, "/logError.html");
+            }
+            else
+            {
+                strcpy(m_url, "/logError.html");
+            }
         }
     }
 
-  else if (*(p + 1) == '2')
-{
-    string login_ip_key = "login_fail_ip:" + client_ip;
-    string login_user_key = string("login_fail_user:") + name;
-
-    if (is_login_blocked(login_ip_key) || is_login_blocked(login_user_key))
-    {
-        LOG_INFO("login blocked by fail limit, user=%s, ip=%s", name, client_ip.c_str());
-        strcpy(m_url, "/logError.html");
-    }
-    else if (users.find(name) != users.end() &&
-             password_hash::verify_password(password, users[name]))
-    {
-        clear_login_fail(login_ip_key);
-        clear_login_fail(login_user_key);
-
-        m_login_user = name;
-        m_set_cookie_sid = create_session(m_login_user);
-
-        if (!m_set_cookie_sid.empty())
-            strcpy(m_url, "/welcome.html");
-        else
-            strcpy(m_url, "/logError.html");
-    }
-    else
-    {
-        record_login_fail(login_ip_key);
-        record_login_fail(login_user_key);
-
-        strcpy(m_url, "/logError.html");
-    }
-}
-
-        if (!m_set_cookie_sid.empty())
-            strcpy(m_url, "/welcome.html");
-        else
-            strcpy(m_url, "/logError.html");
-    }
-    else
-    {
-        strcpy(m_url, "/logError.html");
-    }
-}
-
-
-    
+   
 bool need_login = false;
 
 if (strcmp(m_url, "/welcome.html") == 0 ||
@@ -1766,14 +1563,6 @@ bool http_conn::process_write(HTTP_CODE ret)
 {
     switch (ret)
     {
-    case TOO_MANY_REQUESTS:
-    {
-        add_status_line(429, error_429_title);
-        add_headers(strlen(error_429_form));
-        if (!add_content(error_429_form))
-            return false;
-        break;
-    }
     //1. 服务器内部错误：500
     //在主状态机switch-case出现的错误，一般不会触发
     case INTERNAL_ERROR:
@@ -1828,7 +1617,6 @@ bool http_conn::process_write(HTTP_CODE ret)
                 return false;
         }
     }
-    
     default:
         return false;
     }
