@@ -33,7 +33,7 @@ using namespace std;
 class http_conn{
 public:
     static const int FILENAME_LEN = 200;     //响应资源的文件路径名的最大长度
-    static const int READ_BUFFER_SIZE = 1024 * 512;//浏览器请求报文的最大长度
+    static const int READ_BUFFER_SIZE = 1024 * 8;//浏览器请求报文头和小请求体的最大长度
     static const int WRITE_BUFFER_SIZE = 1024;//服务器响应报文的最大长度
 
     //报文的请求方法，本项目中只用到了GET和POST：分别用于请求资源（网页资源）和提交用户表单（登陆注册）
@@ -54,6 +54,7 @@ public:
     FILE_REQUEST,
     INTERNAL_ERROR,
     CLOSED_CONNECTION,
+    PAYLOAD_TOO_LARGE,
     TOO_MANY_REQUESTS
 };
 
@@ -115,6 +116,7 @@ private:
     long m_read_idx;                    //作为指针记录、维护这个读缓冲区，记录数据已经读到了什么位置
     long m_checked_idx;                 //在从状态机中更新当前正在分析的字符，在主状态机中用于更新m_start_line（get_line的起点）
     long m_body_start;
+    std::string m_body_buffer;          //大请求体单独缓冲，避免每个连接常驻大读缓冲
     int m_start_line;                   //主状态机中通过m_start_line在get_line中获得当前行的字符串（由于\r\n已经被替换成\0\0了，所以取字符串很方便）
     char m_write_buf[WRITE_BUFFER_SIZE];
     int m_write_idx;

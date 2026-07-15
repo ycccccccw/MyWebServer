@@ -36,6 +36,9 @@ public:
     //线程池内的线程数量
     int thread_num;
 
+    //最大并发连接数
+    int max_connections;
+
     //是否关闭日志
     int close_log;
 

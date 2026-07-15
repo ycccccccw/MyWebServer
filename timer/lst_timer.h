@@ -96,6 +96,8 @@ public:
     static int *u_pipefd;
     sort_timer_lst m_timer_lst;//管理定时器容器
     static int u_epollfd;
+    static void (*u_close_conn_cb)(int);
+    static void (*u_release_timer_cb)(util_timer *);
     int m_TIMESLOT;
 };
 

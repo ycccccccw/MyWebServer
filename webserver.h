@@ -7,6 +7,8 @@
 #include <cassert>
 #include <errno.h>
 #include <stdlib.h>
+#include <unordered_map>
+#include <vector>
 
 // epoll并发
 #include <sys/epoll.h>
@@ -19,7 +21,7 @@
 #include "./threadpool/threadpool.h"
 #include "./http/http_conn.h"
 
-const int MAX_FD = 65536;           //最大文件描述符
+const int DEFAULT_MAX_CONNECTIONS = 1024; //默认最大并发连接数
 const int MAX_EVENT_NUMBER = 10000; //最大事件数
 const int TIMESLOT = 5;             //最小超时单位-定时器使用
 
@@ -32,7 +34,7 @@ public:
 
     void init(int port , string user, string passWord, string databaseName,
               int log_write , int opt_linger, int trigmode, int sql_num,
-              int thread_num, int close_log, int actor_model);
+              int thread_num, int close_log, int actor_model, int max_connections);
     
     void thread_pool();
     void sql_pool();
@@ -47,6 +49,15 @@ public:
     bool dealwithsignal(bool& timeout, bool& stop_server);//处理SIGALRM-SIGTERM信号
     void dealwithread(int sockfd);
     void dealwithwrite(int sockfd);
+    http_conn *acquire_conn();
+    client_data *acquire_client_data();
+    util_timer *acquire_timer();
+    void remove_conn(int sockfd);
+    void release_client_data(client_data *data);
+    void release_timer(util_timer *timer);
+
+    static void remove_conn_by_fd(int sockfd);
+    static void release_timer_by_ptr(util_timer *timer);
 
 
 public:
@@ -56,10 +67,11 @@ public:
     int m_log_write;
     int m_close_log;
     int m_actormodel;
+    int m_max_connections;
 
     int m_pipefd[2];    //管道，用于结合epoll实现定时器
     int m_epollfd;      //创建的唯一epoll句柄
-    http_conn *users;   //http_conn对象数组，每个http_conn对象对应一个客户连接
+    std::unordered_map<int, http_conn *> users; //fd到http_conn对象的映射，按连接动态创建
 
     //数据库相关
     connection_pool *m_connPool;//共享数据库连接池
@@ -85,8 +97,17 @@ public:
     int m_CONNTrigmode;
 
     //定时器和epoll实用工具相关
-    client_data *users_timer;
+    std::unordered_map<int, client_data *> users_timer; //fd到定时器用户数据的映射
     Utils utils;//含一些epoll和定时器的实用工具，以及一个双向链表的定时器容器
+
+private:
+    static WebServer *s_instance;
+    std::vector<http_conn *> m_conn_pool;
+    std::vector<http_conn *> m_free_conns;
+    std::vector<client_data *> m_client_data_pool;
+    std::vector<client_data *> m_free_client_data;
+    std::vector<util_timer *> m_timer_pool;
+    std::vector<util_timer *> m_free_timers;
 };
 
 #endif

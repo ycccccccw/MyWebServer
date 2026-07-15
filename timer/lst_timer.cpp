@@ -9,13 +9,8 @@ sort_timer_lst::sort_timer_lst(){
     tail = nullptr;
 }
 sort_timer_lst::~sort_timer_lst(){
-    util_timer *tmp = head;
-    while(tmp){
-        //删除链表中的所有节点
-        head = tmp->next;
-        delete tmp;
-        tmp = head;
-    }
+    head = nullptr;
+    tail = nullptr;
 }
 
 //添加定时器
@@ -26,6 +21,7 @@ void sort_timer_lst::add_timer(util_timer *timer){
     //head为空，当前定时器设为头节点(当前定时器为唯一节点)
     if(!head){
         head = tail = timer;
+        return;
     }
 
     //当前定时器的超时时间 < 头节点的超时时间，插入头节点（实现升序）
@@ -78,7 +74,8 @@ void sort_timer_lst::del_timer(util_timer *timer){
     if((timer == head) && (timer == tail)){
         head = nullptr;
         tail = nullptr;
-        delete timer;
+        if (Utils::u_release_timer_cb)
+            Utils::u_release_timer_cb(timer);
         return;
     }
 
@@ -86,7 +83,8 @@ void sort_timer_lst::del_timer(util_timer *timer){
     if(timer == head){
         head = head->next;//头节点后移
         head->prev = nullptr;//新头节点的前向指针置空
-        delete timer;
+        if (Utils::u_release_timer_cb)
+            Utils::u_release_timer_cb(timer);
         return;
     }
 
@@ -94,14 +92,16 @@ void sort_timer_lst::del_timer(util_timer *timer){
     if(timer == tail){
         tail = tail->prev;//尾节点前移
         tail->next = nullptr;//新尾节点的后向指针置空
-        delete timer;
+        if (Utils::u_release_timer_cb)
+            Utils::u_release_timer_cb(timer);
         return;
     }
 
     //其它情况正常移除节点即可
     timer->prev->next = timer->next;
     timer->next->prev = timer->prev;
-    delete timer;
+    if (Utils::u_release_timer_cb)
+        Utils::u_release_timer_cb(timer);
 }
 
 //调整定时器：当定时器的超时时间延长时(socket有新的收发消息行为)，调整定时器在链表中的位置
@@ -168,7 +168,8 @@ void sort_timer_lst::tick()
         {
             head->prev = NULL;
         }
-        delete tmp;
+        if (Utils::u_release_timer_cb)
+            Utils::u_release_timer_cb(tmp);
         tmp = head;
     }
 }
@@ -262,13 +263,23 @@ void Utils::timer_handler()
 //删除epoll中非活动连接的客户端socket、关闭连接
 int *Utils::u_pipefd = 0;
 int Utils::u_epollfd = 0;
+void (*Utils::u_close_conn_cb)(int) = nullptr;
+void (*Utils::u_release_timer_cb)(util_timer *) = nullptr;
 class Utils;//前向声明
 void cb_func(client_data *user_data){
-    //删除主程序epoll中对应客户端的fdSchufa
-    epoll_ctl(Utils::u_epollfd, EPOLL_CTL_DEL, user_data->sockfd, 0);
     assert(user_data);//断言，确保user_data不为空，否则直接返回
+    int sockfd = user_data->sockfd;
+    user_data->timer = nullptr;
 
-    //关闭客户端socket连接
-    close(user_data->sockfd);
+    if (Utils::u_close_conn_cb)
+    {
+        Utils::u_close_conn_cb(sockfd);
+    }
+    else
+    {
+        //删除主程序epoll中对应客户端的fd
+        epoll_ctl(Utils::u_epollfd, EPOLL_CTL_DEL, sockfd, 0);
+        close(sockfd);
+    }
 
 }

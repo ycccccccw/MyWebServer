@@ -21,6 +21,11 @@ const char *error_404_title = "Not Found";
 const char *error_404_form = "The requested file was not found on this server.\n";
 const char *error_500_title = "Internal Error";
 const char *error_500_form = "There was an unusual problem serving the request file.\n";
+const char *error_413_title = "Payload Too Large";
+const char *error_413_form =
+    "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Payload Too Large</title></head>"
+    "<body><h2>上传文件太大</h2><p>上传内容超过服务器允许的大小，请选择更小的文件后重试。</p>"
+    "<p><a href=\"/upload.html\">返回发布页面</a></p></body></html>";
 const char *error_429_title = "Too Many Requests";
 const char *error_429_form = "Too many requests. Please try again later.\n";
 
@@ -209,7 +214,7 @@ static bool allow_by_token_bucket(const string &key, double capacity, double ref
 static bool allow_request_by_path(const string &client_ip, const string &url)
 {
     if (url == "/upload")
-        return allow_by_token_bucket("upload_ip:" + client_ip, 1, 1.0 / 60.0);
+        return allow_by_token_bucket("upload_ip:" + client_ip, 5, 1.0 / 10.0);
 
     if (url == "/community.html")
         return allow_by_token_bucket("community_ip:" + client_ip, 20, 2.0);
@@ -683,6 +688,7 @@ void http_conn::init()
     m_set_cookie_sid.clear();
     m_start_line = 0;
     m_body_start = 0;
+    m_body_buffer.clear();
     m_checked_idx = 0;
     m_read_idx = 0;
     m_write_idx = 0;
@@ -776,8 +782,25 @@ http_conn::HTTP_CODE http_conn::parse_headers(char *text)
 {
     if (m_content_length != 0)
     {
+        if (m_content_length > MAX_UPLOAD_BODY_SIZE)
+            return PAYLOAD_TOO_LARGE;
+
         m_check_state = CHECK_STATE_CONTENT;
         m_body_start = m_checked_idx;
+
+        if (m_body_start + m_content_length > READ_BUFFER_SIZE)
+        {
+            m_body_buffer.clear();
+            m_body_buffer.reserve(m_content_length);
+            if (m_read_idx > m_body_start)
+            {
+                long body_bytes = m_read_idx - m_body_start;
+                if (body_bytes > m_content_length)
+                    body_bytes = m_content_length;
+                m_body_buffer.append(m_read_buf + m_body_start, body_bytes);
+            }
+        }
+
         return NO_REQUEST;
     }
 
@@ -836,6 +859,19 @@ http_conn::HTTP_CODE http_conn::parse_headers(char *text)
 //处理主状态机状态3：解析请求内容，获取POST请求中的消息体
 http_conn::HTTP_CODE http_conn::parse_content(char *text)
 {
+    if (!m_body_buffer.empty() || m_body_start + m_content_length > READ_BUFFER_SIZE)
+    {
+        if ((long)m_body_buffer.size() >= m_content_length)
+        {
+            m_string = const_cast<char *>(m_body_buffer.data());
+            return GET_REQUEST;
+        }
+
+        LOG_INFO("request body not complete, received=%d, need=%d",
+                 (int)m_body_buffer.size(), (int)m_content_length);
+        return NO_REQUEST;
+    }
+
     if (m_read_idx >= m_body_start + m_content_length)
     {
         m_string = m_read_buf + m_body_start;
@@ -1226,7 +1262,7 @@ http_conn::HTTP_CODE http_conn::do_request()
         if (m_content_length > MAX_UPLOAD_BODY_SIZE)
         {
             LOG_INFO("upload rejected: body too large, content_length=%d", m_content_length);
-            return TOO_MANY_REQUESTS;
+            return PAYLOAD_TOO_LARGE;
         }
 
         handle_upload();
@@ -1455,6 +1491,9 @@ http_conn::HTTP_CODE http_conn::process_read()
             if(ret == BAD_REQUEST){
                 return BAD_REQUEST;
             }
+            else if(ret != NO_REQUEST && ret != GET_REQUEST){
+                return ret;
+            }
             //------------------------------
             else if(ret == GET_REQUEST){
                 return do_request();
@@ -1489,11 +1528,43 @@ http_conn::HTTP_CODE http_conn::process_read()
 // 非阻塞ET工作模式下，需要一次性将数据读完
 bool http_conn::read_once()
 {
-    if (m_read_idx >= READ_BUFFER_SIZE)
+    bool use_body_buffer = (m_check_state == CHECK_STATE_CONTENT &&
+                            m_content_length > 0 &&
+                            m_body_start + m_content_length > READ_BUFFER_SIZE);
+
+    if (!use_body_buffer && m_read_idx >= READ_BUFFER_SIZE)
     {
         return false;
     }
     int bytes_read = 0;
+
+    if (use_body_buffer)
+    {
+        char body_chunk[READ_BUFFER_SIZE];
+
+        while ((long)m_body_buffer.size() < m_content_length)
+        {
+            long remain = m_content_length - m_body_buffer.size();
+            int recv_len = remain < READ_BUFFER_SIZE ? remain : READ_BUFFER_SIZE;
+            bytes_read = recv(m_sockfd, body_chunk, recv_len, 0);
+
+            if (bytes_read == -1)
+            {
+                if (errno == EAGAIN || errno == EWOULDBLOCK)
+                    break;
+
+                return false;
+            }
+            else if (bytes_read == 0)
+            {
+                return false;
+            }
+
+            m_body_buffer.append(body_chunk, bytes_read);
+        }
+
+        return true;
+    }
 
     //将数据读到m_read_buf + m_read_idx位置开始的内存中（存在读缓冲区m_read_buf中）
     //LT方式读取数据：epoll_wait会多次通知读数据，直到读完，所以这里不用while循环
@@ -1645,7 +1716,7 @@ bool http_conn::add_status_line(int status, const char *title)
 // Connection字段：Connection: keep-alive
 bool http_conn::add_headers(int content_len)
 {
-    return add_content_length(content_len) && add_linger() &&
+    return add_content_length(content_len) && add_content_type() && add_linger() &&
            add_session_cookie() && add_blank_line();
 }
 
@@ -1653,10 +1724,10 @@ bool http_conn::add_content_length(int content_len)
 {
     return add_response("Content-Length:%d\r\n", content_len);
 }
-// bool http_conn::add_content_type()
-// {
-//     return add_response("Content-Type:%s\r\n", "text/html");
-// }
+bool http_conn::add_content_type()
+{
+    return add_response("Content-Type:%s\r\n", "text/html; charset=utf-8");
+}
 bool http_conn::add_linger()
 {
     return add_response("Connection:%s\r\n", (m_linger == true) ? "keep-alive" : "close");
@@ -1705,6 +1776,14 @@ bool http_conn::process_write(HTTP_CODE ret)
 {
     switch (ret)
     {
+        case PAYLOAD_TOO_LARGE:
+    {
+        add_status_line(413, error_413_title);
+        add_headers(strlen(error_413_form));
+        if (!add_content(error_413_form))
+            return false;
+        break;
+    }
         case TOO_MANY_REQUESTS:
     {
         add_status_line(429, error_429_title);
@@ -1884,4 +1963,3 @@ void http_conn::process()
     }
     modfd(m_epollfd, m_sockfd, EPOLLOUT, m_TRIGMode);//报文生成成功，注册写事件（EPOLLOUT），发送响应报文
 }
-
