@@ -92,8 +92,6 @@ public:
         return &m_address;
     }
     void initmysql_result(connection_pool *connPool);
-    int timer_flag;
-    int improv;//向主函数传递socket中的读/写操作是否已完成（只是buffer状态，此时解析操作并未完成）
 
 private:
     void init();                                         //无参的负责初始化类中一些状态、计数等的参数为默认值
@@ -127,7 +125,6 @@ public:
     static std::atomic<int> m_user_count;//记录总共的连接数，支持多Reactor并发更新
     static void (*m_completion_cb)(http_conn *, int, uint64_t, PROCESS_RESULT);
     MYSQL *mysql;           //数据库连接(从数据库连接池中获取的)
-    int m_state;            //读为0, 写为1
 
 private:
     int m_epollfd;

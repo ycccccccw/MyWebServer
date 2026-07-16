@@ -772,9 +772,6 @@ void http_conn::reset_request(bool preserve_buffered_data)
     m_write_idx = 0;
     m_response_content_type = "text/html; charset=utf-8";
     cgi = 0;                                //cgi=1 标志是POST请求
-    m_state = 0;
-    timer_flag = 0;
-    improv = 0;
 
     //初始化清空缓冲区
     memset(m_write_buf, '\0', WRITE_BUFFER_SIZE);
@@ -2023,7 +2020,7 @@ bool http_conn::write()
                     modfd(m_epollfd, m_sockfd, EPOLLIN, m_TRIGMode);
                 return true;
             }
-            //短连接return false，在webserver类或者工作线程中结束write后会调用deal_timer中timer的cb_func函数关闭连接
+            //短连接发送完成后通知所属Sub Reactor关闭连接。
             else
             {
                 return false;

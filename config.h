@@ -45,8 +45,6 @@ public:
     //是否关闭日志
     int close_log;
 
-    //并发模型选择:Reactor/Proactor
-    int actor_model;
 };
 
 #endif

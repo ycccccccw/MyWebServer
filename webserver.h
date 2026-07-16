@@ -36,8 +36,7 @@ public:
 
     void init(int port , string user, string passWord, string databaseName,
               int log_write , int opt_linger, int trigmode, int sql_num,
-              int thread_num, int reactor_num, int close_log, int actor_model,
-              int max_connections);
+              int thread_num, int reactor_num, int close_log, int max_connections);
     
     void thread_pool();
     void sql_pool();
@@ -45,25 +44,12 @@ public:
     void trig_mode();
     void eventListen();//socket监听，实现epoll
     void eventLoop();//epoll_wait阻塞监听事件
-    void timer(int connfd, struct sockaddr_in client_address);
-    void adjust_timer(util_timer *timer);
-    void deal_timer(util_timer *timer, int sockfd);
     bool dealclientdata();//处理客户端连接
-    bool dealwithsignal(bool& timeout, bool& stop_server);//处理SIGALRM-SIGTERM信号
-    void dealwithread(int sockfd);
-    void dealwithwrite(int sockfd);
-    void dealwithcompletion();
+    bool dealwithsignal(bool& stop_server);//处理SIGTERM信号
     http_conn *acquire_conn();
-    client_data *acquire_client_data();
-    util_timer *acquire_timer();
-    void remove_conn(int sockfd);
-    void release_client_data(client_data *data);
-    void release_timer(util_timer *timer);
     void recycle_conn(http_conn *conn);
     bool handoff_connection(int connfd, const sockaddr_in &address);
 
-    static void remove_conn_by_fd(int sockfd);
-    static void release_timer_by_ptr(util_timer *timer);
     static void enqueue_completion(http_conn *conn, int sockfd, uint64_t generation,
                                    http_conn::PROCESS_RESULT result);
 
@@ -74,13 +60,10 @@ public:
     char *m_root;
     int m_log_write;
     int m_close_log;
-    int m_actormodel;
     int m_max_connections;
 
-    int m_pipefd[2];    //管道，用于结合epoll实现定时器
-    int m_completionfd; //工作线程通过eventfd通知主线程处理完成结果
-    int m_epollfd;      //创建的唯一epoll句柄
-    std::unordered_map<int, http_conn *> users; //fd到http_conn对象的映射，按连接动态创建
+    int m_pipefd[2];    //信号处理函数通过管道通知Main Reactor退出
+    int m_epollfd;      //Main Reactor的epoll句柄
 
     //数据库相关
     connection_pool *m_connPool;//共享数据库连接池
@@ -106,29 +89,13 @@ public:
     int m_LISTENTrigmode;
     int m_CONNTrigmode;
 
-    //定时器和epoll实用工具相关
-    std::unordered_map<int, client_data *> users_timer; //fd到定时器用户数据的映射
-    Utils utils;//含一些epoll和定时器的实用工具，以及一个双向链表的定时器容器
+    Utils utils;
 
 private:
-    struct completion_event
-    {
-        http_conn *conn;
-        int sockfd;
-        uint64_t generation;
-        http_conn::PROCESS_RESULT result;
-    };
-
     static WebServer *s_instance;
-    locker m_completion_lock;
     locker m_conn_pool_lock;
-    std::vector<completion_event> m_completions;
     std::vector<http_conn *> m_conn_pool;
     std::vector<http_conn *> m_free_conns;
-    std::vector<client_data *> m_client_data_pool;
-    std::vector<client_data *> m_free_client_data;
-    std::vector<util_timer *> m_timer_pool;
-    std::vector<util_timer *> m_free_timers;
     std::vector<SubReactor *> m_reactors;
     size_t m_next_reactor;
 };

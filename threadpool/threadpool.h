@@ -11,9 +11,8 @@ template <typename T>
 class threadpool{
 public:
     /*thread_number是线程池中线程的数量，max_requests是请求队列中最多允许的、等待处理的请求的数量*/
-    threadpool(int actor_model, connection_pool *connPool, int thread_number = 8, int max_request = 10000);
+    threadpool(int thread_number = 8, int max_request = 10000);
     ~threadpool();
-    bool append(T *request, int state);
     bool append_p(T *request);
 
 private:
@@ -28,14 +27,12 @@ private:
     std::list<T *> m_workqueue; //请求队列（Tasks）
     locker m_queuelocker;       //保护请求队列的互斥锁
     sem m_queuestat;            //是否有任务需要处理
-    connection_pool *m_connPool;  //数据库连接池，为每个任务提供一个数据库连接
-    int m_actor_model;          //事件处理模型切换：Reactor/Proactor
 };
 
 //构造函数：初始化参数 && 创建工作线程
 template <typename T>
-threadpool<T>::threadpool(int actor_model, connection_pool *connPool, int thread_number, int max_requests) :
-    m_actor_model(actor_model), m_connPool(connPool), m_thread_number(thread_number), m_max_requests(max_requests), m_threads(NULL){
+threadpool<T>::threadpool(int thread_number, int max_requests) :
+    m_thread_number(thread_number), m_max_requests(max_requests), m_threads(NULL){
     
     if(thread_number <= 0 || max_requests <= 0){
         //线程数和请求队列长度必须大于0
@@ -73,31 +70,7 @@ threadpool<T>::~threadpool(){
     delete[] m_threads;
 }
 
-//向请求队列中添加任务(Reactor模式)
-template <typename T>
-bool threadpool<T>::append(T *request, int state){
-    //操作工作队列时一定要加锁，因为它被所有线程共享
-    m_queuelocker.lock();
-    
-    if(m_workqueue.size() >= m_max_requests){
-        //请求队列满了
-        m_queuelocker.unlock();
-        return false;
-    }
-
-    request->m_state = state;//state 0代表读事件，state 1代表写事件
-    m_workqueue.push_back(request);
-
-    m_queuelocker.unlock();
-
-    //信号量+1，唤醒一个线程
-    m_queuestat.post();
-
-    return true;
-}
-
-//向请求队列中添加任务(Proactor模式)
-//由于Proactor模式下，socketfd上的读写事件都是由主线程来处理的，所以这里只需要将任务添加到请求队列中即可，不需要state参数来判断是什么事件
+//Sub Reactor完成socket I/O后，将业务处理任务加入队列。
 template <typename T>
 bool threadpool<T>::append_p(T *request)
 {
@@ -145,33 +118,8 @@ void threadpool<T>::run(){
             continue;
         }
 
-        //根据事件处理模型切换：Reactor/Proactor（m_actor_model）
-        if(m_actor_model == 1){//Reactor模式
-            if(request->m_state == 0){//读事件
-                if(request->read_once()){//读取数据成功
-                    request->improv = 1;//通知主线程中的dealwithread，表示该任务已交由工作线程处理
-                    request->process();//处理请求:解析请求报文，处理业务逻辑，生成响应报文
-                }
-                else {//读取数据失败
-                    request->improv = 1;
-                    request->timer_flag = 1;
-                }
-            }
-            else{//写事件
-                if (request->write()){//写数据成功
-                    request->improv = 1;
-                }
-                else {//写数据失败
-                    request->improv = 1;
-                    request->timer_flag = 1;
-                }
-            }
-        }
-        else {//Proactor模式，直接处理请求，不需要判断事件类型
-            typename T::PROCESS_RESULT result;
-            result = request->process_async();
-            request->notify_completion(result);
-        }
+        typename T::PROCESS_RESULT result = request->process_async();
+        request->notify_completion(result);
     }
 }
 #endif
