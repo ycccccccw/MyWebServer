@@ -238,8 +238,10 @@ static bool allow_request_by_path(const string &client_ip, const string &url)
     if (url == "/community.html")
         return allow_by_token_bucket("community_ip:" + client_ip, 20, 2.0);
 
+    // A community page may contain many authenticated media resources. Counting
+    // every image against one IP bucket turns a valid page load into HTTP 429s.
     if (url.find("/uploads/") == 0)
-        return allow_by_token_bucket("uploads_ip:" + client_ip, 60, 6.0);
+        return true;
 
     if (url.find("/2") == 0)
         return allow_by_token_bucket("login_ip:" + client_ip, 10, 1.0 / 6.0);
@@ -1079,7 +1081,8 @@ bool http_conn::rebuild_community_page()
 
             if (file_type == "image")
             {
-                html += "<p><img src=\"" + safe_path + "\" style=\"max-width:500px;\"></p>";
+                html += "<p><img src=\"" + safe_path +
+                        "\" loading=\"lazy\" decoding=\"async\" style=\"max-width:500px;\"></p>";
             }
             else if (file_type == "video")
             {
