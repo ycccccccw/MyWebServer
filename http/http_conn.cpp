@@ -111,6 +111,25 @@ static string get_file_type(const string &filename)
     return "other";
 }
 
+static const char *get_mime_type(const char *path)
+{
+    string lower = to_lower_copy(path ? path : "");
+    size_t dot = lower.rfind('.');
+    string ext = dot == string::npos ? "" : lower.substr(dot);
+
+    if (ext == ".html" || ext == ".htm") return "text/html; charset=utf-8";
+    if (ext == ".css") return "text/css; charset=utf-8";
+    if (ext == ".js") return "application/javascript; charset=utf-8";
+    if (ext == ".txt") return "text/plain; charset=utf-8";
+    if (ext == ".jpg" || ext == ".jpeg") return "image/jpeg";
+    if (ext == ".png") return "image/png";
+    if (ext == ".gif") return "image/gif";
+    if (ext == ".ico") return "image/x-icon";
+    if (ext == ".mp4") return "video/mp4";
+    if (ext == ".webm") return "video/webm";
+    return "application/octet-stream";
+}
+
 static string get_safe_filename(const string &filename)
 {
     string name = filename;
@@ -647,7 +666,8 @@ void http_conn::close_conn(bool real_close){
 
 //初始化客户端连接中http_conn的一些用户状态参数，这个函数是在主线程（epoll）中收到用户的连接处理accept时调用的
 void http_conn::init(int sockfd, const sockaddr_in &addr, char *root, int TRTGMide, int close_log,
-                     string user, string passwd, string sqlname, int epollfd, int owner_reactor)
+                     string user, string passwd, string sqlname, int epollfd,
+                     connection_pool *conn_pool, int owner_reactor)
 {
     ++m_generation;
     m_processing.store(false);
@@ -655,6 +675,7 @@ void http_conn::init(int sockfd, const sockaddr_in &addr, char *root, int TRTGMi
     m_sockfd = sockfd;
     m_epollfd = epollfd;
     m_owner_reactor = owner_reactor;
+    m_conn_pool = conn_pool;
     m_address = addr;
 
     m_TRIGMode = TRTGMide;
@@ -749,6 +770,7 @@ void http_conn::reset_request(bool preserve_buffered_data)
     m_checked_idx = 0;
     m_read_idx = remaining;
     m_write_idx = 0;
+    m_response_content_type = "text/html; charset=utf-8";
     cgi = 0;                                //cgi=1 标志是POST请求
     m_state = 0;
     timer_flag = 0;
@@ -1271,7 +1293,8 @@ if (csrf_token_from_form.empty() ||
         return true;
     }
 
-    if (!save_post_to_db(username, content_text, file_path, file_type))
+    connectionRAII mysqlcon(&mysql, m_conn_pool);
+    if (!mysql || !save_post_to_db(username, content_text, file_path, file_type))
     {
         LOG_INFO("upload failed: save post to db failed");
         strcpy(m_url, "/upload.html");
@@ -1364,9 +1387,10 @@ http_conn::HTTP_CODE http_conn::do_request()
             }
             else if (users.find(user_name) == users.end())
             {
+                connectionRAII mysqlcon(&mysql, m_conn_pool);
                 m_lock.lock();
 
-                bool insert_ok = insert_user_by_stmt(mysql, user_name, hashed_password);
+                bool insert_ok = mysql && insert_user_by_stmt(mysql, user_name, hashed_password);
                 if (insert_ok)
                 {
                     users.insert(pair<string, string>(user_name, hashed_password));
@@ -1789,7 +1813,7 @@ bool http_conn::add_content_length(int content_len)
 }
 bool http_conn::add_content_type()
 {
-    return add_response("Content-Type:%s\r\n", "text/html; charset=utf-8");
+    return add_response("Content-Type:%s\r\n", m_response_content_type);
 }
 bool http_conn::add_linger()
 {
@@ -1886,6 +1910,7 @@ bool http_conn::process_write(HTTP_CODE ret)
     //4. 请求资源可以正常访问：200
     case FILE_REQUEST:
     {
+        m_response_content_type = get_mime_type(m_real_file);
         add_status_line(200, ok_200_title);
         if (m_file_stat.st_size != 0)
         {
@@ -1969,18 +1994,21 @@ bool http_conn::write()
         bytes_have_send += temp;
         bytes_to_send -= temp;
 
-        //第一个缓冲区m_write_buf已全部发送完
-        if (bytes_have_send >= m_iv[0].iov_len)
-        {
-            m_iv[0].iov_len = 0;
-            m_iv[1].iov_base = m_file_address + (bytes_have_send - m_write_idx);
-            m_iv[1].iov_len = bytes_to_send;
-        }
-        //第一个缓冲区m_write_buf还没发送完，更新m_iv[0]后继续发送
-        else
+        // 始终以原始响应头长度m_write_idx计算偏移，不能使用已经被缩短的iov_len。
+        if (bytes_have_send < m_write_idx)
         {
             m_iv[0].iov_base = m_write_buf + bytes_have_send;
-            m_iv[0].iov_len = m_iv[0].iov_len - bytes_have_send;
+            m_iv[0].iov_len = m_write_idx - bytes_have_send;
+        }
+        else
+        {
+            m_iv[0].iov_len = 0;
+            if (m_iv_count == 2)
+            {
+                int file_bytes_sent = bytes_have_send - m_write_idx;
+                m_iv[1].iov_base = m_file_address + file_bytes_sent;
+                m_iv[1].iov_len = m_file_stat.st_size - file_bytes_sent;
+            }
         }
 
         //缓冲区全部发送完毕，取消响应资源文件的映射并重新将sockfd注册为读事件（EPOLLIN）

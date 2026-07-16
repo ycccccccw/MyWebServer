@@ -341,7 +341,7 @@ void WebServer::timer(int connfd, sockaddr_in client_address)
     }
 
     conn->init(connfd, client_address, m_root, m_CONNTrigmode, m_close_log, m_user,
-               m_passWord, m_databaseName, m_epollfd, 0);
+               m_passWord, m_databaseName, m_epollfd, m_connPool, 0);
     users[connfd] = conn;
 
     //创建定时器，初始化定时器节点

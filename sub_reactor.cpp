@@ -142,7 +142,7 @@ void SubReactor::handle_notifications()
     for (const pending_connection &item : pending) {
         item.conn->init(item.sockfd, item.address, m_server->m_root, m_server->m_CONNTrigmode,
                         m_server->m_close_log, m_server->m_user, m_server->m_passWord,
-                        m_server->m_databaseName, m_epollfd, m_id);
+                        m_server->m_databaseName, m_epollfd, m_server->m_connPool, m_id);
         m_connections[item.sockfd] = item.conn;
         ++m_connection_count;
         refresh_deadline(item.sockfd);

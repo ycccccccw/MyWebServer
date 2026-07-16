@@ -175,3 +175,62 @@ Set-Cookie: sid=...; Max-Age=1800; HttpOnly; SameSite=Lax
 - 上传请求先解析请求头，根据 `Content-Length` 判断 body 大小。
 - 大 body 使用额外动态缓冲区保存，避免每个普通连接都长期携带大上传缓冲区。
 - 上传内容超过限制时返回自定义 `413 Payload Too Large` 页面。
+
+### 2026-07-16：HTTP 长连接与 Main-Sub Reactor
+
+本次升级完善了 HTTP/1.1 长连接处理，并将网络 I/O 改造为 Main-Sub Reactor 架构。
+
+主要改动：
+
+- Main Reactor 只负责监听端口和接收新连接。
+- 新连接按轮询方式分配给多个 Sub Reactor。
+- 每个 Sub Reactor 独立管理 `epoll`、连接、定时器和完成队列。
+- Worker 线程只负责 HTTP 解析和业务处理，处理结果通过完成队列通知所属 Sub Reactor。
+- 支持同一 TCP 连接连续处理多个 HTTP 请求。
+- 支持 HTTP/1.1 管线化：一次读取到多个完整请求时依次生成并发送响应。
+- 请求不完整时保留缓冲区数据，等待后续 TCP 数据到达，解决半包问题。
+- 一个 TCP 数据包包含多个 HTTP 请求时按报文边界解析，解决粘包问题。
+- 静态文件请求不再占用 MySQL 连接，注册和上传等数据库业务按需获取连接。
+
+### 2026-07-16：静态资源响应修复
+
+- 根据文件扩展名返回正确的 `Content-Type`，支持 HTML、CSS、JavaScript、图片和视频等资源。
+- 修复非阻塞 socket 下 `writev()` 部分写入后的偏移计算错误。
+- 响应未一次写完时，会根据累计发送字节数继续发送正确的响应头或文件位置。
+- 避免高并发或大文件响应时出现图片数据缺失、浏览器偶发显示破图的问题。
+
+## 编译与启动
+
+```bash
+make
+./start_server.sh -r 1 -t 2 -s 2 -n 8192 -m 3 -c 0
+```
+
+常用参数：
+
+- `-p`：监听端口，默认 `9006`。
+- `-r`：Sub Reactor 数量。
+- `-t`：业务 Worker 线程数量。
+- `-s`：MySQL 连接池大小。
+- `-n`：最大并发连接数。
+- `-m`：监听 socket 和连接 socket 的触发模式。
+- `-c`：是否关闭日志，`0` 表示开启，`1` 表示关闭。
+- `-a`：并发模型，`0` 表示 Proactor，`1` 表示 Reactor。
+
+`-r 1 -t 2` 是当前 2 核测试服务器上表现较好的配置。线程数并非越多越好，应根据 CPU 核数、业务耗时和压测结果调整。
+
+## 长连接测试
+
+测试同一 TCP 连接连续发送两个 HTTP 请求：
+
+```bash
+printf 'GET /judge.html HTTP/1.1\r\nHost: localhost\r\n\r\nGET /picture.html HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' | nc 127.0.0.1 9006
+```
+
+使用 `wrk` 测试 HTTP/1.1 长连接性能：
+
+```bash
+wrk -t2 -c1000 -d10s --latency http://127.0.0.1:9006/judge.html
+```
+
+当前 2 核服务器本机测试结果约为 `42,668 requests/sec`，平均延迟约 `23.18 ms`，测试结果会受到机器配置、日志、数据库和压测端 CPU 占用影响。

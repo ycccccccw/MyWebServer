@@ -150,7 +150,6 @@ void threadpool<T>::run(){
             if(request->m_state == 0){//读事件
                 if(request->read_once()){//读取数据成功
                     request->improv = 1;//通知主线程中的dealwithread，表示该任务已交由工作线程处理
-                    connectionRAII mysqlcon(&request->mysql, m_connPool);//自动获取数据库连接
                     request->process();//处理请求:解析请求报文，处理业务逻辑，生成响应报文
                 }
                 else {//读取数据失败
@@ -170,10 +169,7 @@ void threadpool<T>::run(){
         }
         else {//Proactor模式，直接处理请求，不需要判断事件类型
             typename T::PROCESS_RESULT result;
-            {
-                connectionRAII mysqlcon(&request->mysql, m_connPool);//自动获取数据库连接
-                result = request->process_async();
-            }
+            result = request->process_async();
             request->notify_completion(result);
         }
     }

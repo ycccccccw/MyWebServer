@@ -64,13 +64,13 @@ enum HTTP_CODE
 
 public:
     http_conn() : m_epollfd(-1), m_sockfd(-1), m_file_address(0), m_TRIGMode(0),
-                  m_processing(false), m_timeout_pending(false), m_generation(0),
-                  m_owner_reactor(0) {}
+                  m_conn_pool(nullptr), m_processing(false), m_timeout_pending(false),
+                  m_generation(0), m_owner_reactor(0) {}
     ~http_conn(){}
 
 public:
     void init(int sockfd, const sockaddr_in &addr, char *, int, int, string user, string passwd,
-              string sqlname, int epollfd, int owner_reactor = 0);
+              string sqlname, int epollfd, connection_pool *conn_pool, int owner_reactor = 0);
     void close_conn(bool real_close = true); //从epoll中删除并关闭socket连接
     void process(); //工作线程中取出任务（读取完数据后）进行报文解析处理
     PROCESS_RESULT process_async();
@@ -142,6 +142,7 @@ private:
     int m_start_line;                   //主状态机中通过m_start_line在get_line中获得当前行的字符串（由于\r\n已经被替换成\0\0了，所以取字符串很方便）
     char m_write_buf[WRITE_BUFFER_SIZE];
     int m_write_idx;
+    const char *m_response_content_type;
     CHECK_STATE m_check_state;          //主状态机的状态（当前正在解析的报文内容：请求行 or 头部 or 内容）
     METHOD m_method;
     char m_real_file[FILENAME_LEN];     //客户请求的资源在服务器上的完整路径（服务器最终返回的资源路径，root + url）
@@ -167,6 +168,7 @@ private:
     map<string, string> m_users;
     int m_TRIGMode;
     int m_close_log;
+    connection_pool *m_conn_pool;
     std::atomic<bool> m_processing;
     std::atomic<bool> m_timeout_pending;
     uint64_t m_generation;
