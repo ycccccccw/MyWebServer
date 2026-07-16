@@ -86,6 +86,7 @@ public:
     void arm_write();
     bool read_once();
     bool write();
+    bool has_pending_write() const { return bytes_to_send > 0; }
     bool has_buffered_request() const { return m_read_idx > 0; }
     sockaddr_in *get_address()
     {

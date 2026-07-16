@@ -37,7 +37,7 @@ private:
     void handle_read(int sockfd);
     void handle_write(int sockfd);
     void close_connection(int sockfd);
-    void refresh_deadline(int sockfd);
+    void refresh_deadline(int sockfd, int timeout_seconds);
     void expire_idle_connections();
     bool dispatch(http_conn *conn);
 

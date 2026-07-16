@@ -6,6 +6,7 @@
 #include <errno.h>
 
 static const int SUB_REACTOR_IDLE_TIMEOUT = 3 * TIMESLOT;
+static const int SUB_REACTOR_WRITE_TIMEOUT = 60;
 
 SubReactor::SubReactor(WebServer *server, int id)
     : m_server(server), m_id(id), m_epollfd(-1), m_notifyfd(-1),
@@ -82,9 +83,9 @@ bool SubReactor::dispatch(http_conn *conn)
     return false;
 }
 
-void SubReactor::refresh_deadline(int sockfd)
+void SubReactor::refresh_deadline(int sockfd, int timeout_seconds)
 {
-    m_deadlines[sockfd] = time(nullptr) + SUB_REACTOR_IDLE_TIMEOUT;
+    m_deadlines[sockfd] = time(nullptr) + timeout_seconds;
 }
 
 void SubReactor::close_connection(int sockfd)
@@ -112,7 +113,7 @@ void SubReactor::handle_read(int sockfd)
         close_connection(sockfd);
         return;
     }
-    refresh_deadline(sockfd);
+    refresh_deadline(sockfd, SUB_REACTOR_IDLE_TIMEOUT);
 }
 
 void SubReactor::handle_write(int sockfd)
@@ -124,7 +125,8 @@ void SubReactor::handle_write(int sockfd)
         close_connection(sockfd);
         return;
     }
-    refresh_deadline(sockfd);
+    refresh_deadline(sockfd, conn->has_pending_write() ? SUB_REACTOR_WRITE_TIMEOUT
+                                                       : SUB_REACTOR_IDLE_TIMEOUT);
     if (conn->has_buffered_request() && !dispatch(conn)) close_connection(sockfd);
 }
 
@@ -145,7 +147,7 @@ void SubReactor::handle_notifications()
                         m_server->m_databaseName, m_epollfd, m_server->m_connPool, m_id);
         m_connections[item.sockfd] = item.conn;
         ++m_connection_count;
-        refresh_deadline(item.sockfd);
+        refresh_deadline(item.sockfd, SUB_REACTOR_IDLE_TIMEOUT);
     }
 
     for (const completion_event &event : completed) {
@@ -156,8 +158,10 @@ void SubReactor::handle_notifications()
             close_connection(event.sockfd);
         } else if (event.result == http_conn::PROCESS_NEED_READ) {
             event.conn->arm_read();
+            refresh_deadline(event.sockfd, SUB_REACTOR_IDLE_TIMEOUT);
         } else if (event.result == http_conn::PROCESS_READY_WRITE) {
             event.conn->arm_write();
+            refresh_deadline(event.sockfd, SUB_REACTOR_WRITE_TIMEOUT);
         } else {
             close_connection(event.sockfd);
         }
