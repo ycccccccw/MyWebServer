@@ -1,10 +1,12 @@
 #include "webserver.h"
+#include <sys/eventfd.h>
 
 WebServer *WebServer::s_instance = nullptr;
 
 WebServer::WebServer(){
     s_instance = this;
     m_max_connections = DEFAULT_MAX_CONNECTIONS;
+    m_completionfd = -1;
 
     //root文件夹路径
     char server_path[200];
@@ -20,6 +22,8 @@ WebServer::~WebServer(){
     close(m_listenfd);
     close(m_pipefd[1]);
     close(m_pipefd[0]);
+    if (m_completionfd != -1)
+        close(m_completionfd);
     for (auto &item : users)
     {
         item.second->close_conn();
@@ -122,6 +126,23 @@ void WebServer::release_timer_by_ptr(util_timer *timer)
     }
 }
 
+void WebServer::enqueue_completion(http_conn *conn, int sockfd, uint64_t generation,
+                                   http_conn::PROCESS_RESULT result)
+{
+    WebServer *server = s_instance;
+    if (!server)
+        return;
+
+    completion_event event = {conn, sockfd, generation, result};
+    server->m_completion_lock.lock();
+    server->m_completions.push_back(event);
+    server->m_completion_lock.unlock();
+
+    uint64_t value = 1;
+    ssize_t ignored = write(server->m_completionfd, &value, sizeof(value));
+    (void)ignored;
+}
+
 void WebServer::release_timer(util_timer *timer)
 {
     if (!timer)
@@ -142,6 +163,8 @@ void WebServer::remove_conn(int sockfd)
     auto it = users.find(sockfd);
     if (it != users.end())
     {
+        if (it->second->defer_timeout())
+            return;
         it->second->close_conn();
         m_free_conns.push_back(it->second);
         users.erase(it);
@@ -440,7 +463,12 @@ void WebServer::dealwithread(int sockfd){
         }
 
         //主线程将读事件放到线程池请求队列中就结束了，其它的交给线程池
-        m_pool->append(conn, 0);
+        if (!m_pool->append(conn, 0))
+        {
+            LOG_ERROR("reactor read queue full, close fd %d", sockfd);
+            deal_timer(timer, sockfd);
+            return;
+        }
 
         //等待事件别工作线程读取完，进入解析状态
         while(true){//由于与工作线程分开的，所以需要while等待工作线程读/写完数据再关闭定时器
@@ -465,7 +493,14 @@ void WebServer::dealwithread(int sockfd){
             LOG_INFO("deal with the client(%s)", inet_ntoa(conn->get_address()->sin_addr));
 
             //将读取的数据放在线程池请求队列中进行解析和打包响应
-            m_pool->append_p(conn);
+            conn->begin_processing();
+            if (!m_pool->append_p(conn))
+            {
+                conn->cancel_processing();
+                LOG_ERROR("request queue full, close fd %d", sockfd);
+                deal_timer(timer, sockfd);
+                return;
+            }
 
             //成功接收数据，重新设置定时器表示连接重新活跃
             if (timer)
@@ -501,6 +536,27 @@ void WebServer::dealwithwrite(int sockfd){
     }
     http_conn *conn = it->second;
 
+    auto dispatch_buffered_request = [this, conn, timer, sockfd]() -> bool {
+        if (!conn->has_buffered_request())
+            return true;
+
+        if (m_actormodel == 0)
+            conn->begin_processing();
+        bool queued = (m_actormodel == 1) ? m_pool->append(conn, 0) : m_pool->append_p(conn);
+        if (!queued)
+        {
+            if (m_actormodel == 0)
+                conn->cancel_processing();
+            LOG_ERROR("pipeline request queue full, close fd %d", sockfd);
+            deal_timer(timer, sockfd);
+            return false;
+        }
+
+        if (timer)
+            adjust_timer(timer);
+        return true;
+    };
+
     //Reactor模式下，直接将fd交给工作线程，由工作线程处理socket写数据操作
     if(m_actormodel == 1){
         if (timer)
@@ -509,7 +565,12 @@ void WebServer::dealwithwrite(int sockfd){
         }
 
         //主线程将写事件放到线程池请求队列中就结束了，其它的交给线程池
-        m_pool->append(conn, 1);
+        if (!m_pool->append(conn, 1))
+        {
+            LOG_ERROR("reactor write queue full, close fd %d", sockfd);
+            deal_timer(timer, sockfd);
+            return;
+        }
 
         while(true){
             if(conn->improv == 1){//任务被工作线程取出就会置1
@@ -521,6 +582,7 @@ void WebServer::dealwithwrite(int sockfd){
                     break;
                 }
                 conn->improv = 0;
+                dispatch_buffered_request();
                 break;
             }
         }
@@ -537,11 +599,55 @@ void WebServer::dealwithwrite(int sockfd){
             {
                 adjust_timer(timer);
             }
+            dispatch_buffered_request();
         }
         else
         {
             //发送数据失败，关闭连接和定时器
             deal_timer(timer, sockfd);
+        }
+    }
+}
+
+void WebServer::dealwithcompletion()
+{
+    uint64_t value;
+    while (read(m_completionfd, &value, sizeof(value)) > 0)
+    {
+    }
+
+    std::vector<completion_event> completed;
+    m_completion_lock.lock();
+    completed.swap(m_completions);
+    m_completion_lock.unlock();
+
+    for (const completion_event &event : completed)
+    {
+        auto user_it = users.find(event.sockfd);
+        if (user_it == users.end() || user_it->second != event.conn ||
+            event.conn->generation() != event.generation)
+            continue;
+
+        bool timed_out = event.conn->finish_processing();
+        if (timed_out)
+        {
+            remove_conn(event.sockfd);
+            continue;
+        }
+
+        if (event.result == http_conn::PROCESS_NEED_READ)
+        {
+            event.conn->arm_read();
+        }
+        else if (event.result == http_conn::PROCESS_READY_WRITE)
+        {
+            event.conn->arm_write();
+        }
+        else
+        {
+            auto timer_it = users_timer.find(event.sockfd);
+            util_timer *timer = timer_it == users_timer.end() ? nullptr : timer_it->second->timer;
+            deal_timer(timer, event.sockfd);
         }
     }
 }
@@ -603,6 +709,10 @@ void WebServer::eventListen(){
     assert(ret != -1);
     utils.setnonblocking(m_pipefd[1]);//设置写端非阻塞
     utils.addfd(m_epollfd, m_pipefd[0], false, 0);//将读端加入主线程epoll监听
+    m_completionfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    assert(m_completionfd != -1);
+    utils.addfd(m_epollfd, m_completionfd, false, 0);
+    http_conn::m_completion_cb = WebServer::enqueue_completion;
     //绑定不同信号（SIGPIPE-SIGALRM-SIGTERM）的信号处理函数（忽略 or sig_handler发送sig标识）
     utils.addsig(SIGPIPE, SIG_IGN);
     utils.addsig(SIGALRM, utils.sig_handler, false);
@@ -657,6 +767,9 @@ void WebServer::eventLoop(){
                 bool flag = dealwithsignal(timeout, stop_server);
                 if (false == flag)
                     LOG_ERROR("%s", "dealclientdata failure");
+            }
+            else if((sockfd == m_completionfd) && (events[i].events & EPOLLIN)){
+                dealwithcompletion();
             }
             //处理客户fd连接上接收到的数据
             else if(events[i].events & EPOLLIN){

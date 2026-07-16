@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <unordered_map>
 #include <vector>
+#include <stdint.h>
 
 // epoll并发
 #include <sys/epoll.h>
@@ -49,6 +50,7 @@ public:
     bool dealwithsignal(bool& timeout, bool& stop_server);//处理SIGALRM-SIGTERM信号
     void dealwithread(int sockfd);
     void dealwithwrite(int sockfd);
+    void dealwithcompletion();
     http_conn *acquire_conn();
     client_data *acquire_client_data();
     util_timer *acquire_timer();
@@ -58,6 +60,8 @@ public:
 
     static void remove_conn_by_fd(int sockfd);
     static void release_timer_by_ptr(util_timer *timer);
+    static void enqueue_completion(http_conn *conn, int sockfd, uint64_t generation,
+                                   http_conn::PROCESS_RESULT result);
 
 
 public:
@@ -70,6 +74,7 @@ public:
     int m_max_connections;
 
     int m_pipefd[2];    //管道，用于结合epoll实现定时器
+    int m_completionfd; //工作线程通过eventfd通知主线程处理完成结果
     int m_epollfd;      //创建的唯一epoll句柄
     std::unordered_map<int, http_conn *> users; //fd到http_conn对象的映射，按连接动态创建
 
@@ -101,7 +106,17 @@ public:
     Utils utils;//含一些epoll和定时器的实用工具，以及一个双向链表的定时器容器
 
 private:
+    struct completion_event
+    {
+        http_conn *conn;
+        int sockfd;
+        uint64_t generation;
+        http_conn::PROCESS_RESULT result;
+    };
+
     static WebServer *s_instance;
+    locker m_completion_lock;
+    std::vector<completion_event> m_completions;
     std::vector<http_conn *> m_conn_pool;
     std::vector<http_conn *> m_free_conns;
     std::vector<client_data *> m_client_data_pool;

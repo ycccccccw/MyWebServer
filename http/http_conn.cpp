@@ -629,6 +629,7 @@ void removefd(int epollfd, int fd){
 
 int http_conn::m_user_count = 0;
 int http_conn::m_epollfd = -1;
+void (*http_conn::m_completion_cb)(http_conn *, int, uint64_t, PROCESS_RESULT) = nullptr;
 
 //关闭连接
 void http_conn::close_conn(bool real_close){
@@ -648,15 +649,18 @@ void http_conn::close_conn(bool real_close){
 //初始化客户端连接中http_conn的一些用户状态参数，这个函数是在主线程（epoll）中收到用户的连接处理accept时调用的
 void http_conn::init(int sockfd, const sockaddr_in &addr, char *root, int TRTGMide, int close_log, string user, string passwd, string sqlname)
 {
+    ++m_generation;
+    m_processing.store(false);
+    m_timeout_pending.store(false);
     m_sockfd = sockfd;
     m_address = addr;
 
+    m_TRIGMode = TRTGMide;
     addfd(m_epollfd, sockfd, true, m_TRIGMode);//将sockfd注册到epoll中
     m_user_count++;//客户端连接数+1
 
     //当浏览器出现连接重置时，可能是网站根目录出错或http响应格式出错或者访问的文件中内容完全为空
     doc_root = root;
-    m_TRIGMode = TRTGMide;
     m_close_log = close_log;
 
     //更新数据库的用户名、密码、数据库名
@@ -669,14 +673,64 @@ void http_conn::init(int sockfd, const sockaddr_in &addr, char *root, int TRTGMi
 
 }
 
+bool http_conn::defer_timeout()
+{
+    if (!m_processing.load())
+        return false;
+
+    m_timeout_pending.store(true);
+    return true;
+}
+
+bool http_conn::finish_processing()
+{
+    m_processing.store(false);
+    return m_timeout_pending.exchange(false);
+}
+
+void http_conn::arm_read()
+{
+    modfd(m_epollfd, m_sockfd, EPOLLIN, m_TRIGMode);
+}
+
+void http_conn::arm_write()
+{
+    modfd(m_epollfd, m_sockfd, EPOLLOUT, m_TRIGMode);
+}
+
+void http_conn::notify_completion(PROCESS_RESULT result)
+{
+    if (m_completion_cb)
+        m_completion_cb(this, m_sockfd, m_generation, result);
+}
+
 //初始化http_conn类中剩下的一些参数为默认值
 void http_conn::init()
 {
+    m_read_idx = 0;
+    memset(m_read_buf, '\0', READ_BUFFER_SIZE);
+    reset_request(false);
+}
+
+void http_conn::reset_request(bool preserve_buffered_data)
+{
+    long remaining = 0;
+    if (preserve_buffered_data && m_request_end >= 0 && m_request_end <= m_read_idx)
+    {
+        remaining = m_read_idx - m_request_end;
+        if (remaining > 0)
+            memmove(m_read_buf, m_read_buf + m_request_end, remaining);
+    }
+
+    if (remaining < READ_BUFFER_SIZE)
+        memset(m_read_buf + remaining, '\0', READ_BUFFER_SIZE - remaining);
+
     mysql = NULL;
     bytes_to_send = 0;
     bytes_have_send = 0;
     m_check_state = CHECK_STATE_REQUESTLINE;//根据报文的结构，主状态机初始状态应该是解析请求行，也就是CHECK_STATE_REQUESTLINE
-    m_linger = false;
+    // 本服务器只接受HTTP/1.1；持久连接是HTTP/1.1的默认行为。
+    m_linger = true;
     m_method = GET;
     m_url = 0;
     m_version = 0;
@@ -688,9 +742,10 @@ void http_conn::init()
     m_set_cookie_sid.clear();
     m_start_line = 0;
     m_body_start = 0;
+    m_request_end = 0;
     m_body_buffer.clear();
     m_checked_idx = 0;
-    m_read_idx = 0;
+    m_read_idx = remaining;
     m_write_idx = 0;
     cgi = 0;                                //cgi=1 标志是POST请求
     m_state = 0;
@@ -698,7 +753,6 @@ void http_conn::init()
     improv = 0;
 
     //初始化清空缓冲区
-    memset(m_read_buf, '\0', READ_BUFFER_SIZE);
     memset(m_write_buf, '\0', WRITE_BUFFER_SIZE);
     memset(m_real_file, '\0', FILENAME_LEN);
 }
@@ -804,6 +858,7 @@ http_conn::HTTP_CODE http_conn::parse_headers(char *text)
         return NO_REQUEST;
     }
 
+    m_request_end = m_checked_idx;
     return GET_REQUEST;
 }
 
@@ -813,10 +868,10 @@ http_conn::HTTP_CODE http_conn::parse_headers(char *text)
     {
         text += 11;
         text += strspn(text, " \t");
-        if (strcasecmp(text, "keep-alive") == 0)
-        {
-            m_linger = true;//用于返回响应报文时添加对应的Connection字段的值
-        }
+        if (strcasecmp(text, "close") == 0)
+            m_linger = false;
+        else if (strcasecmp(text, "keep-alive") == 0)
+            m_linger = true;
     }
     //3. 解析Content-Length字段，获取消息体的长度（主要是用于判断主状态机是否需要转为CHECK_STATE_CONTENT状态）
     else if (strncasecmp(text, "Content-length:", 15) == 0)
@@ -864,6 +919,7 @@ http_conn::HTTP_CODE http_conn::parse_content(char *text)
         if ((long)m_body_buffer.size() >= m_content_length)
         {
             m_string = const_cast<char *>(m_body_buffer.data());
+            m_request_end = m_body_start + m_content_length;
             return GET_REQUEST;
         }
 
@@ -875,6 +931,7 @@ http_conn::HTTP_CODE http_conn::parse_content(char *text)
     if (m_read_idx >= m_body_start + m_content_length)
     {
         m_string = m_read_buf + m_body_start;
+        m_request_end = m_body_start + m_content_length;
         return GET_REQUEST;
     }
 
@@ -1608,6 +1665,10 @@ bool http_conn::read_once()
                 return false;
             }
             m_read_idx += bytes_read;
+            // 缓冲区可能包含一条完整请求和下一条请求的前半部分；
+            // 先交给HTTP状态机消费，避免以长度0再次recv并误判为断开。
+            if (m_read_idx >= READ_BUFFER_SIZE)
+                break;
         }
         return true;//ET读完所有数据返回
     }
@@ -1924,12 +1985,12 @@ bool http_conn::write()
         if (bytes_to_send <= 0)
         {
             unmap();
-            modfd(m_epollfd, m_sockfd, EPOLLIN, m_TRIGMode);
-
             //保持长连接，重新初始化http_conn类中的一些参数
             if (m_linger)
             {
-                init();
+                reset_request(true);
+                if (!has_buffered_request())
+                    modfd(m_epollfd, m_sockfd, EPOLLIN, m_TRIGMode);
                 return true;
             }
             //短连接return false，在webserver类或者工作线程中结束write后会调用deal_timer中timer的cb_func函数关闭连接
@@ -1962,4 +2023,16 @@ void http_conn::process()
         close_conn();//报文生成失败，关闭连接
     }
     modfd(m_epollfd, m_sockfd, EPOLLOUT, m_TRIGMode);//报文生成成功，注册写事件（EPOLLOUT），发送响应报文
+}
+
+http_conn::PROCESS_RESULT http_conn::process_async()
+{
+    HTTP_CODE read_ret = process_read();
+    if (read_ret == NO_REQUEST)
+        return PROCESS_NEED_READ;
+
+    if (!process_write(read_ret))
+        return PROCESS_CLOSE;
+
+    return PROCESS_READY_WRITE;
 }

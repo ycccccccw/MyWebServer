@@ -21,6 +21,8 @@
 #include <sys/wait.h>
 #include <sys/uio.h>
 #include <map>
+#include <atomic>
+#include <stdint.h>
 #include <string>
 using namespace std;
 
@@ -44,7 +46,7 @@ public:
     //从状态机的状态：从buff中读取一个完整的行，状态有行出错，行数据尚且不完整（LT模式下会有LINE_OPEN）等
     enum LINE_STATUS {LINE_OK = 0, LINE_BAD, LINE_OPEN};
     //主状态机解析报文的结果：有无完整的报文
-    enum HTTP_CODE
+enum HTTP_CODE
 {
     NO_REQUEST,
     GET_REQUEST,
@@ -58,16 +60,30 @@ public:
     TOO_MANY_REQUESTS
 };
 
+    enum PROCESS_RESULT { PROCESS_NEED_READ, PROCESS_READY_WRITE, PROCESS_CLOSE };
+
 public:
-    http_conn(){}
+    http_conn() : m_sockfd(-1), m_file_address(0), m_TRIGMode(0),
+                  m_processing(false), m_timeout_pending(false), m_generation(0) {}
     ~http_conn(){}
 
 public:
     void init(int sockfd, const sockaddr_in &addr, char *, int, int, string user, string passwd, string sqlname);//有参初始化当前http连接的用户信息
     void close_conn(bool real_close = true); //从epoll中删除并关闭socket连接
     void process(); //工作线程中取出任务（读取完数据后）进行报文解析处理
+    PROCESS_RESULT process_async();
+    void notify_completion(PROCESS_RESULT result);
+    void begin_processing() { m_processing.store(true); }
+    void cancel_processing() { m_processing.store(false); }
+    bool defer_timeout();
+    bool finish_processing();
+    uint64_t generation() const { return m_generation; }
+    int sockfd() const { return m_sockfd; }
+    void arm_read();
+    void arm_write();
     bool read_once();
     bool write();
+    bool has_buffered_request() const { return m_read_idx > 0; }
     sockaddr_in *get_address()
     {
         return &m_address;
@@ -78,6 +94,7 @@ public:
 
 private:
     void init();                                         //无参的负责初始化类中一些状态、计数等的参数为默认值
+    void reset_request(bool preserve_buffered_data);     //重置单次HTTP请求状态，可保留管线中的后续请求
     HTTP_CODE process_read();                            //主状态机：解析处理报文中的请求行、请求头、请求内容
     bool process_write(HTTP_CODE ret);
     HTTP_CODE parse_request_line(char *text);
@@ -106,6 +123,7 @@ private:
 public:
     static int m_epollfd;   //这里是主线程中的epollfd
     static int m_user_count;//记录总共的连接数，静态值保证所有http_conn对象共享
+    static void (*m_completion_cb)(http_conn *, int, uint64_t, PROCESS_RESULT);
     MYSQL *mysql;           //数据库连接(从数据库连接池中获取的)
     int m_state;            //读为0, 写为1
 
@@ -116,6 +134,7 @@ private:
     long m_read_idx;                    //作为指针记录、维护这个读缓冲区，记录数据已经读到了什么位置
     long m_checked_idx;                 //在从状态机中更新当前正在分析的字符，在主状态机中用于更新m_start_line（get_line的起点）
     long m_body_start;
+    long m_request_end;                  //当前请求在读缓冲区中的结束位置
     std::string m_body_buffer;          //大请求体单独缓冲，避免每个连接常驻大读缓冲
     int m_start_line;                   //主状态机中通过m_start_line在get_line中获得当前行的字符串（由于\r\n已经被替换成\0\0了，所以取字符串很方便）
     char m_write_buf[WRITE_BUFFER_SIZE];
@@ -145,6 +164,9 @@ private:
     map<string, string> m_users;
     int m_TRIGMode;
     int m_close_log;
+    std::atomic<bool> m_processing;
+    std::atomic<bool> m_timeout_pending;
+    uint64_t m_generation;
 
     char sql_user[100];
     char sql_passwd[100];

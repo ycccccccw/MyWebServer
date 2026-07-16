@@ -169,9 +169,12 @@ void threadpool<T>::run(){
             }
         }
         else {//Proactor模式，直接处理请求，不需要判断事件类型
-            connectionRAII mysqlcon(&request->mysql, m_connPool);//自动获取数据库连接
-            request->process();//处理请求:解析请求报文，处理业务逻辑，生成响应报文
-
+            typename T::PROCESS_RESULT result;
+            {
+                connectionRAII mysqlcon(&request->mysql, m_connPool);//自动获取数据库连接
+                result = request->process_async();
+            }
+            request->notify_completion(result);
         }
     }
 }
