@@ -627,8 +627,7 @@ void removefd(int epollfd, int fd){
 }
 
 
-int http_conn::m_user_count = 0;
-int http_conn::m_epollfd = -1;
+std::atomic<int> http_conn::m_user_count(0);
 void (*http_conn::m_completion_cb)(http_conn *, int, uint64_t, PROCESS_RESULT) = nullptr;
 
 //关闭连接
@@ -647,12 +646,15 @@ void http_conn::close_conn(bool real_close){
 /*------------------------------HTTP类初始化 BEGIN--------------------------------------------------------*/
 
 //初始化客户端连接中http_conn的一些用户状态参数，这个函数是在主线程（epoll）中收到用户的连接处理accept时调用的
-void http_conn::init(int sockfd, const sockaddr_in &addr, char *root, int TRTGMide, int close_log, string user, string passwd, string sqlname)
+void http_conn::init(int sockfd, const sockaddr_in &addr, char *root, int TRTGMide, int close_log,
+                     string user, string passwd, string sqlname, int epollfd, int owner_reactor)
 {
     ++m_generation;
     m_processing.store(false);
     m_timeout_pending.store(false);
     m_sockfd = sockfd;
+    m_epollfd = epollfd;
+    m_owner_reactor = owner_reactor;
     m_address = addr;
 
     m_TRIGMode = TRTGMide;

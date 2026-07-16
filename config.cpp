@@ -28,6 +28,9 @@ Config::Config(){
     //线程池内的线程数量,默认8,这个参数可以根据服务器的负载情况进行调整
     thread_num = 8;
 
+    //Sub Reactor数量，独立于业务工作线程
+    reactor_num = 4;
+
     //最大并发连接数,默认1024
     max_connections = DEFAULT_MAX_CONNECTIONS;
 
@@ -41,7 +44,7 @@ Config::Config(){
 void Config::parse_arg(int argc, char* argv[]){
     //argc是参数个数(至少为1);argv是参数数组,argv[0]是程序名
     int opt;//用于保存getopt的返回值
-    const char*str = "p:l:m:o:s:t:n:c:a:";//选项字符串,每个选项后面的冒号表示该选项后面需要接一个参数
+    const char*str = "p:l:m:o:s:t:r:n:c:a:";//选项字符串,每个选项后面的冒号表示该选项后面需要接一个参数
     while ((opt=getopt(argc, argv, str)) != -1){
         //getopt是个迭代器,每次取出一个选项,并将选项对应的参数赋值给全局变量optarg
         switch (opt){
@@ -68,6 +71,10 @@ void Config::parse_arg(int argc, char* argv[]){
         }
         case 't':{
             thread_num = atoi(optarg);
+            break;
+        }
+        case 'r':{
+            reactor_num = atoi(optarg);
             break;
         }
         case 'n':{

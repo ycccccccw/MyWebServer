@@ -1,4 +1,5 @@
 #include "webserver.h"
+#include "sub_reactor.h"
 #include <sys/eventfd.h>
 
 WebServer *WebServer::s_instance = nullptr;
@@ -7,6 +8,7 @@ WebServer::WebServer(){
     s_instance = this;
     m_max_connections = DEFAULT_MAX_CONNECTIONS;
     m_completionfd = -1;
+    m_next_reactor = 0;
 
     //root文件夹路径
     char server_path[200];
@@ -18,6 +20,11 @@ WebServer::WebServer(){
 }
 
 WebServer::~WebServer(){
+    for (SubReactor *reactor : m_reactors)
+        reactor->stop();
+    for (SubReactor *reactor : m_reactors)
+        delete reactor;
+    m_reactors.clear();
     close(m_epollfd);
     close(m_listenfd);
     close(m_pipefd[1]);
@@ -65,14 +72,38 @@ void WebServer::remove_conn_by_fd(int sockfd)
 
 http_conn *WebServer::acquire_conn()
 {
+    m_conn_pool_lock.lock();
     if (m_free_conns.empty())
     {
+        m_conn_pool_lock.unlock();
         return nullptr;
     }
 
     http_conn *conn = m_free_conns.back();
     m_free_conns.pop_back();
+    m_conn_pool_lock.unlock();
     return conn;
+}
+
+void WebServer::recycle_conn(http_conn *conn)
+{
+    if (!conn) return;
+    m_conn_pool_lock.lock();
+    m_free_conns.push_back(conn);
+    m_conn_pool_lock.unlock();
+}
+
+bool WebServer::handoff_connection(int connfd, const sockaddr_in &address)
+{
+    http_conn *conn = acquire_conn();
+    if (!conn || m_reactors.empty()) {
+        if (conn) recycle_conn(conn);
+        utils.show_error(connfd, "Internal server busy");
+        return false;
+    }
+    SubReactor *reactor = m_reactors[m_next_reactor++ % m_reactors.size()];
+    reactor->enqueue_connection(conn, connfd, address);
+    return true;
 }
 
 client_data *WebServer::acquire_client_data()
@@ -133,14 +164,9 @@ void WebServer::enqueue_completion(http_conn *conn, int sockfd, uint64_t generat
     if (!server)
         return;
 
-    completion_event event = {conn, sockfd, generation, result};
-    server->m_completion_lock.lock();
-    server->m_completions.push_back(event);
-    server->m_completion_lock.unlock();
-
-    uint64_t value = 1;
-    ssize_t ignored = write(server->m_completionfd, &value, sizeof(value));
-    (void)ignored;
+    int owner = conn->owner_reactor();
+    if (owner >= 0 && owner < static_cast<int>(server->m_reactors.size()))
+        server->m_reactors[owner]->enqueue_completion(conn, sockfd, generation, result);
 }
 
 void WebServer::release_timer(util_timer *timer)
@@ -179,7 +205,8 @@ void WebServer::remove_conn(int sockfd)
 }
 
 void WebServer::init(int port, string user, string passWord, string databaseName, int log_write, 
-                     int opt_linger, int trigmode, int sql_num, int thread_num, int close_log, int actor_model,
+                     int opt_linger, int trigmode, int sql_num, int thread_num, int reactor_num,
+                     int close_log, int actor_model,
                      int max_connections)
 {
     m_port = port;
@@ -188,11 +215,14 @@ void WebServer::init(int port, string user, string passWord, string databaseName
     m_databaseName = databaseName;
     m_sql_num = sql_num;
     m_thread_num = thread_num;
+    m_reactor_count = reactor_num > 0 ? reactor_num : 1;
     m_log_write = log_write;
     m_OPT_LINGER = opt_linger;
     m_TRIGMode = trigmode;
     m_close_log = close_log;
-    m_actormodel = actor_model;
+    // 多Reactor中socket I/O固定由Sub Reactor负责，Worker只执行Proactor业务阶段。
+    (void)actor_model;
+    m_actormodel = 0;
     m_max_connections = max_connections > 0 ? max_connections : DEFAULT_MAX_CONNECTIONS;
 
     m_conn_pool.reserve(m_max_connections);
@@ -310,7 +340,8 @@ void WebServer::timer(int connfd, sockaddr_in client_address)
         return;
     }
 
-    conn->init(connfd, client_address, m_root, m_CONNTrigmode, m_close_log, m_user, m_passWord, m_databaseName);
+    conn->init(connfd, client_address, m_root, m_CONNTrigmode, m_close_log, m_user,
+               m_passWord, m_databaseName, m_epollfd, 0);
     users[connfd] = conn;
 
     //创建定时器，初始化定时器节点
@@ -369,12 +400,8 @@ bool WebServer::dealclientdata(){
         }
 
         //服务器连接数量达到上限了，拒绝浏览器的连接
-        if(m_free_conns.empty() || m_free_client_data.empty() || m_free_timers.empty() || http_conn::m_user_count >= m_max_connections){
-            utils.show_error(connfd, "Internal server busy");//向客户端发送错误信息，并关闭连接
+        if (!handoff_connection(connfd, client_address))
             LOG_ERROR("%s", "Internal server busy");
-            return false;
-        }
-        timer(connfd, client_address);//在timer中执行http_conn初始化,并将connfd加入epoll监听，为新的客户端连接在定时器容器中创建定时器
     }
 
     else{
@@ -388,12 +415,8 @@ bool WebServer::dealclientdata(){
             }
 
             //服务器连接数量达到上限了，拒绝浏览器的连接
-            if(m_free_conns.empty() || m_free_client_data.empty() || m_free_timers.empty() || http_conn::m_user_count >= m_max_connections){
-                utils.show_error(connfd, "Internal server busy");//向客户端发送错误信息，并关闭连接
+            if (!handoff_connection(connfd, client_address))
                 LOG_ERROR("%s", "Internal server busy");
-                return false;
-            }
-            timer(connfd, client_address);//在timer中执行http_conn初始化,并将connfd加入epoll监听，为新的客户端连接在定时器容器中创建定时器
         }
         return false;
     }
@@ -701,7 +724,6 @@ void WebServer::eventListen(){
 
     //将监听的socket加入epoll监听
     utils.addfd(m_epollfd, m_listenfd, false, m_LISTENTrigmode);
-    http_conn::m_epollfd = m_epollfd;//HTTP类里面的静态变量m_epollfd其实就是主线程中的epool，是同一个
 
     //通过socketpair创建全双工管道,管道也是一种文件描述符
     //管道作用:可以通过管道在程序中实现进程间通信
@@ -713,6 +735,16 @@ void WebServer::eventListen(){
     assert(m_completionfd != -1);
     utils.addfd(m_epollfd, m_completionfd, false, 0);
     http_conn::m_completion_cb = WebServer::enqueue_completion;
+    for (int i = 0; i < m_reactor_count; ++i)
+    {
+        SubReactor *reactor = new SubReactor(this, i);
+        if (!reactor->start())
+        {
+            delete reactor;
+            throw std::runtime_error("failed to start sub reactor");
+        }
+        m_reactors.push_back(reactor);
+    }
     //绑定不同信号（SIGPIPE-SIGALRM-SIGTERM）的信号处理函数（忽略 or sig_handler发送sig标识）
     utils.addsig(SIGPIPE, SIG_IGN);
     utils.addsig(SIGALRM, utils.sig_handler, false);

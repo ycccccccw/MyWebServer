@@ -63,12 +63,14 @@ enum HTTP_CODE
     enum PROCESS_RESULT { PROCESS_NEED_READ, PROCESS_READY_WRITE, PROCESS_CLOSE };
 
 public:
-    http_conn() : m_sockfd(-1), m_file_address(0), m_TRIGMode(0),
-                  m_processing(false), m_timeout_pending(false), m_generation(0) {}
+    http_conn() : m_epollfd(-1), m_sockfd(-1), m_file_address(0), m_TRIGMode(0),
+                  m_processing(false), m_timeout_pending(false), m_generation(0),
+                  m_owner_reactor(0) {}
     ~http_conn(){}
 
 public:
-    void init(int sockfd, const sockaddr_in &addr, char *, int, int, string user, string passwd, string sqlname);//有参初始化当前http连接的用户信息
+    void init(int sockfd, const sockaddr_in &addr, char *, int, int, string user, string passwd,
+              string sqlname, int epollfd, int owner_reactor = 0);
     void close_conn(bool real_close = true); //从epoll中删除并关闭socket连接
     void process(); //工作线程中取出任务（读取完数据后）进行报文解析处理
     PROCESS_RESULT process_async();
@@ -79,6 +81,7 @@ public:
     bool finish_processing();
     uint64_t generation() const { return m_generation; }
     int sockfd() const { return m_sockfd; }
+    int owner_reactor() const { return m_owner_reactor; }
     void arm_read();
     void arm_write();
     bool read_once();
@@ -121,13 +124,13 @@ private:
 
 
 public:
-    static int m_epollfd;   //这里是主线程中的epollfd
-    static int m_user_count;//记录总共的连接数，静态值保证所有http_conn对象共享
+    static std::atomic<int> m_user_count;//记录总共的连接数，支持多Reactor并发更新
     static void (*m_completion_cb)(http_conn *, int, uint64_t, PROCESS_RESULT);
     MYSQL *mysql;           //数据库连接(从数据库连接池中获取的)
     int m_state;            //读为0, 写为1
 
 private:
+    int m_epollfd;
     int m_sockfd;                       //在主线程处理http连接时会通过timer将客户端socket传递给http_conn
     sockaddr_in m_address;
     char m_read_buf[READ_BUFFER_SIZE];  //读缓冲区
@@ -167,6 +170,7 @@ private:
     std::atomic<bool> m_processing;
     std::atomic<bool> m_timeout_pending;
     uint64_t m_generation;
+    int m_owner_reactor;
 
     char sql_user[100];
     char sql_passwd[100];

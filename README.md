@@ -161,6 +161,7 @@ Set-Cookie: sid=...; Max-Age=1800; HttpOnly; SameSite=Lax
 - 修复空定时器链表插入首个节点时可能形成异常链表的问题。
 - 将原来的 `MAX_FD` 语义改为 `DEFAULT_MAX_CONNECTIONS`，明确表示最大并发连接数，而不是系统 fd 最大编号。
 - 新增启动参数 `-n` 配置最大并发连接数，例如 `./start_server.sh -n 4096`。
+- 使用主从 Reactor：主线程只负责 `accept`，`-r` 配置 Sub Reactor I/O 线程数（默认 4），`-t` 配置独立的业务 Worker 数量（默认 8）。
 
 优化后的含义：
 

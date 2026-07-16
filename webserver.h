@@ -27,6 +27,7 @@ const int MAX_EVENT_NUMBER = 10000; //最大事件数
 const int TIMESLOT = 5;             //最小超时单位-定时器使用
 
 using namespace std;
+class SubReactor;
 
 class WebServer{
 public:
@@ -35,7 +36,7 @@ public:
 
     void init(int port , string user, string passWord, string databaseName,
               int log_write , int opt_linger, int trigmode, int sql_num,
-              int thread_num, int close_log, int actor_model, int max_connections);
+              int thread_num, int reactor_num, int close_log, int actor_model, int max_connections);
     
     void thread_pool();
     void sql_pool();
@@ -57,6 +58,8 @@ public:
     void remove_conn(int sockfd);
     void release_client_data(client_data *data);
     void release_timer(util_timer *timer);
+    void recycle_conn(http_conn *conn);
+    bool handoff_connection(int connfd, const sockaddr_in &address);
 
     static void remove_conn_by_fd(int sockfd);
     static void release_timer_by_ptr(util_timer *timer);
@@ -88,6 +91,7 @@ public:
     //线程池相关
     threadpool<http_conn> *m_pool;
     int m_thread_num;
+    int m_reactor_count;
 
     //epoll_event相关
     //epoll_event是<sys/epoll.h>中定义的一个结构体，用于注册事件
@@ -116,6 +120,7 @@ private:
 
     static WebServer *s_instance;
     locker m_completion_lock;
+    locker m_conn_pool_lock;
     std::vector<completion_event> m_completions;
     std::vector<http_conn *> m_conn_pool;
     std::vector<http_conn *> m_free_conns;
@@ -123,6 +128,8 @@ private:
     std::vector<client_data *> m_free_client_data;
     std::vector<util_timer *> m_timer_pool;
     std::vector<util_timer *> m_free_timers;
+    std::vector<SubReactor *> m_reactors;
+    size_t m_next_reactor;
 };
 
 #endif
