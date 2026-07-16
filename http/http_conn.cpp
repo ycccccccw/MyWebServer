@@ -633,7 +633,9 @@ void modfd(int epollfd, int fd, int ev, int TRIGMode)
     epoll_event event;
     event.data.fd = fd;
 
-    if (1 == TRIGMode)
+    // Reads may drain the socket in ET mode. Writes use LT so an EAGAIN retry
+    // cannot miss the next writable notification while rearming EPOLLONESHOT.
+    if (1 == TRIGMode && ev == EPOLLIN)
         event.events = ev | EPOLLET | EPOLLONESHOT | EPOLLRDHUP;//ET模式下，EPOLLONESHOT是必须的
     else
         event.events = ev | EPOLLONESHOT | EPOLLRDHUP;
@@ -1960,9 +1962,6 @@ void http_conn::unmap()
 // Proactor模式下，主线程调用users[sockfd].write函数向客户端发送响应报文，不经过工作线程处理
 bool http_conn::write()
 {
-    int temp = 0;
-
-    //没有数据需要发送，将sockfd从epoll中注册写事件（EPOLLOUT）改为读事件（EPOLLIN）继续监听
     if (bytes_to_send == 0)
     {
         modfd(m_epollfd, m_sockfd, EPOLLIN, m_TRIGMode);
@@ -1970,52 +1969,52 @@ bool http_conn::write()
         return true;
     }
 
-    //将响应报文发送给客户端
-    while (1)
+    while (bytes_to_send > 0)
     {
-        temp = writev(m_sockfd, m_iv, m_iv_count);//将多个缓冲区iovec的数据一次性写入（发送）I/O描述符（m_sockfd）
+        const char *data = nullptr;
+        size_t remaining = 0;
 
-        //发送失败：eagain满了暂时不可用 or 其他情况（取消映射）
-        if (temp < 0)
+        if (bytes_have_send < m_write_idx)
         {
-            //I/O缓冲区暂时满了，将sockfd再次注册写事件（EPOLLOUT）继续等待下一次写事件继续发送
-            if (errno == EAGAIN)
-            {
-                modfd(m_epollfd, m_sockfd, EPOLLOUT, m_TRIGMode);
-                return true;
-            }
+            data = m_write_buf + bytes_have_send;
+            remaining = m_write_idx - bytes_have_send;
+        }
+        else if (m_iv_count == 2)
+        {
+            int file_bytes_sent = bytes_have_send - m_write_idx;
+            data = m_file_address + file_bytes_sent;
+            remaining = m_file_stat.st_size - file_bytes_sent;
+        }
 
-            //未知原因发送失败，取消响应资源文件的映射
+        if (!data || remaining == 0)
+        {
             unmap();
             return false;
         }
 
-        //writev负责将缓冲区iovec数据写入I/O描述符，但是不会对已发送的数据进行删除，所以需要更新缓冲区iovec已发送的数据长度
-        bytes_have_send += temp;
-        bytes_to_send -= temp;
-
-        // 始终以原始响应头长度m_write_idx计算偏移，不能使用已经被缩短的iov_len。
-        if (bytes_have_send < m_write_idx)
+        ssize_t sent = send(m_sockfd, data, remaining, MSG_NOSIGNAL);
+        if (sent < 0)
         {
-            m_iv[0].iov_base = m_write_buf + bytes_have_send;
-            m_iv[0].iov_len = m_write_idx - bytes_have_send;
-        }
-        else
-        {
-            m_iv[0].iov_len = 0;
-            if (m_iv_count == 2)
+            if (errno == EINTR)
+                continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
             {
-                int file_bytes_sent = bytes_have_send - m_write_idx;
-                m_iv[1].iov_base = m_file_address + file_bytes_sent;
-                m_iv[1].iov_len = m_file_stat.st_size - file_bytes_sent;
+                modfd(m_epollfd, m_sockfd, EPOLLOUT, m_TRIGMode);
+                return true;
             }
+            unmap();
+            return false;
         }
 
-        //缓冲区全部发送完毕，取消响应资源文件的映射并重新将sockfd注册为读事件（EPOLLIN）
+        if (sent == 0)
+            return false;
+
+        bytes_have_send += sent;
+        bytes_to_send -= sent;
+
         if (bytes_to_send <= 0)
         {
             unmap();
-            //保持长连接，重新初始化http_conn类中的一些参数
             if (m_linger)
             {
                 reset_request(true);
@@ -2023,11 +2022,7 @@ bool http_conn::write()
                     modfd(m_epollfd, m_sockfd, EPOLLIN, m_TRIGMode);
                 return true;
             }
-            //短连接发送完成后通知所属Sub Reactor关闭连接。
-            else
-            {
-                return false;
-            }
+            return false;
         }
     }
     return false;

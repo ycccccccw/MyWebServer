@@ -100,6 +100,7 @@ void SubReactor::close_connection(int sockfd)
     conn->close_conn();
     m_connections.erase(it);
     m_deadlines.erase(sockfd);
+    m_pending_writes.erase(sockfd);
     --m_connection_count;
     m_server->recycle_conn(conn);
 }
@@ -125,6 +126,10 @@ void SubReactor::handle_write(int sockfd)
         close_connection(sockfd);
         return;
     }
+    if (conn->has_pending_write())
+        m_pending_writes.insert(sockfd);
+    else
+        m_pending_writes.erase(sockfd);
     refresh_deadline(sockfd, conn->has_pending_write() ? SUB_REACTOR_WRITE_TIMEOUT
                                                        : SUB_REACTOR_IDLE_TIMEOUT);
     if (conn->has_buffered_request() && !dispatch(conn)) close_connection(sockfd);
@@ -161,6 +166,7 @@ void SubReactor::handle_notifications()
             refresh_deadline(event.sockfd, SUB_REACTOR_IDLE_TIMEOUT);
         } else if (event.result == http_conn::PROCESS_READY_WRITE) {
             event.conn->arm_write();
+            m_pending_writes.insert(event.sockfd);
             refresh_deadline(event.sockfd, SUB_REACTOR_WRITE_TIMEOUT);
         } else {
             close_connection(event.sockfd);
@@ -180,15 +186,34 @@ void SubReactor::expire_idle_connections()
 void SubReactor::run()
 {
     epoll_event events[1024];
+    time_t last_write_retry = 0;
     while (m_running.load()) {
         int count = epoll_wait(m_epollfd, events, 1024, 1000);
         if (count < 0 && errno != EINTR) break;
         for (int i = 0; i < count; ++i) {
             int fd = events[i].data.fd;
             if (fd == m_notifyfd) handle_notifications();
-            else if (events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) close_connection(fd);
-            else if (events[i].events & EPOLLIN) handle_read(fd);
-            else if (events[i].events & EPOLLOUT) handle_write(fd);
+            else if (events[i].events & (EPOLLHUP | EPOLLERR)) close_connection(fd);
+            else {
+                auto it = m_connections.find(fd);
+                bool pending_write = it != m_connections.end() &&
+                                     it->second->has_pending_write();
+                if (pending_write && (events[i].events & EPOLLOUT))
+                    handle_write(fd);
+                else if (events[i].events & EPOLLIN)
+                    handle_read(fd);
+                else if (events[i].events & EPOLLOUT)
+                    handle_write(fd);
+                else if (events[i].events & EPOLLRDHUP)
+                    close_connection(fd);
+            }
+        }
+        time_t now = time(nullptr);
+        if (now != last_write_retry) {
+            last_write_retry = now;
+            std::vector<int> pending_writes(m_pending_writes.begin(), m_pending_writes.end());
+            for (int fd : pending_writes)
+                if (m_connections.find(fd) != m_connections.end()) handle_write(fd);
         }
         expire_idle_connections();
     }

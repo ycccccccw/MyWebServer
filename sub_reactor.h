@@ -4,6 +4,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <time.h>
 #include "http/http_conn.h"
@@ -53,6 +54,7 @@ private:
     std::vector<completion_event> m_completed;
     std::unordered_map<int, http_conn *> m_connections;
     std::unordered_map<int, time_t> m_deadlines;
+    std::unordered_set<int> m_pending_writes;
 };
 
 #endif
